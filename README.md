@@ -20,13 +20,13 @@ unpin tcc hello.c -o hello
 Pick a different target with `-target=` and the same binary cross-compiles — no toolchain to install, no sysroot on disk:
 
 ```bash
-unpin tcc -target=arm64    hello.c -o hello       # arm64 Linux ELF
-unpin tcc -target=riscv64  hello.c -o hello       # riscv64 Linux ELF
-unpin tcc -target=windows  hello.c -o hello.exe   # x86_64 Windows PE
-unpin tcc -target=arm64-osx hello.c -o hello      # arm64 macOS Mach-O
+unpin tcc -target=aarch64-linux   hello.c -o hello       # aarch64 Linux ELF
+unpin tcc -target=riscv64-linux   hello.c -o hello       # riscv64 Linux ELF
+unpin tcc -target=x86_64-windows  hello.c -o hello.exe   # x86_64 Windows PE
+unpin tcc -target=aarch64-darwin  hello.c -o hello       # aarch64 macOS Mach-O
 ```
 
-The full target set is `x86_64`, `i386` (also `-m32`), `arm`, `arm64`, `riscv64`, `windows`, `x86_64-osx` and `arm64-osx`; the catalog/system spellings (`aarch64`, `x86_64-darwin`, …) work too. To put `tcc` on your PATH:
+Target names follow the usual `arch-os` convention — the same spellings as the nix systems and release assets, and the only ones accepted: `x86_64-linux`, `i686-linux`, `armv7l-linux`, `aarch64-linux`, `riscv64-linux`, `x86_64-windows`, `x86_64-darwin` and `aarch64-darwin`. To put `tcc` on your PATH:
 
 ```bash
 unpin install tcc

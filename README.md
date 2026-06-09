@@ -70,6 +70,18 @@ The [Releases](https://github.com/unpins/tcc/releases) page has standalone binar
   inside the binary, served by a `--wrap=open` VFS (the same machinery as
   [unpins/perl](https://github.com/unpins/perl) and [vim](https://github.com/unpins/vim)).
   So the one file compiles **and links** real C with nothing on disk.
+- **Sysroots are built from source — no per-target gcc, no cache dependency.** Each
+  Linux target's musl `libc.a`, crt objects and headers are compiled from the musl
+  sources at build time by a single multi-target `clang --target=…` (the `zig cc`
+  model: one toolchain retargets via `--target`, instead of a full cross-gcc per
+  arch). So a cold `nix build` reproduces every sysroot on any host — macOS
+  included — from source, not from a warm binary cache. tcc itself can't bootstrap
+  musl (no `_Complex`, only partial inline-asm/constraint support), and its archive
+  reader only parses GNU `ar` indexes, so the musl build forces `llvm-ar
+  --format=gnu` and skips the darwin strip phase (cctools `strip` would otherwise
+  re-pack `libc.a` in BSD form, which tcc can't read). RISC-V needs one extra patch:
+  clang coalesces the `auipc`/`addi` PC-relative pairs that tcc assumes alternate,
+  so its reloc handler is taught clang's hoisted hi/lo scheme.
 - **Self-contained, binary and output alike.** The tcc binary has no runtime
   dependencies — a static-musl ELF on Linux (no loader, no `/nix/store`), a
   crt-folded PE on Windows, a `libSystem`-only Mach-O on macOS — and what it

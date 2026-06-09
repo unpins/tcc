@@ -23,10 +23,10 @@
 # build-host vs host: generating each libtcc1.a means RUNNING tcc at build time,
 # so the `<t>-tcc` tools build with the build-host cc (`pkgs.buildPackages`) and
 # run here, while each `<t>-tcc.o` is recompiled with the host cc (`$CC`), since
-# it carries the compiler logic that runs on the host. The Linux target sysroots
-# are host-independent machine code; their derivations are sourced from the build
-# machine's own Linux pkgs (so each CI runner builds them natively), falling back
-# to x86_64-linux on a darwin host where musl doesn't evaluate.
+# it carries the compiler logic that runs on the host. The embedded Linux sysroots
+# are likewise built here from source (see mkSysroot) — never fetched-only — so a
+# cold `nix build` reproduces them on any host, macOS included, with no per-target
+# gcc and no dependence on a warm cache.
 pkgs:
 let
   lib = pkgs.lib;
@@ -43,20 +43,11 @@ let
   buildCC = "${hp.buildPackages.stdenv.cc}/bin/cc";
   buildAR = "${hp.buildPackages.stdenv.cc.bintools.bintools}/bin/ar";
 
-  # Linux-target artifacts (tinycc source + the per-arch musl sysroots that
-  # become each ELF backend's headers/crt/libc.a) are host-independent machine
-  # code, but their *derivations* must build on the machine running this build.
-  # Source them from the build platform's own pkgs when it's Linux (so the arm CI
-  # runners produce aarch64-linux drvs they can build, the x86_64 runners produce
-  # x86_64-linux drvs); on a darwin host, where musl doesn't evaluate, fall back
-  # to x86_64-linux (built on the remote Linux builder / substituted from cache).
-  # Every target below is pinned to its arch via pkgsCross, so the chosen base's
-  # native arch never leaks into a backend's sysroot.
-  linuxSystem =
-    if pkgs.stdenv.buildPlatform.isLinux
-    then pkgs.stdenv.buildPlatform.system
-    else "x86_64-linux";
-  linuxPkgs = import pkgs.path { system = linuxSystem; };
+  # A pkgs native to the BUILD machine — darwin included, never a foreign system a
+  # host can't build. tinycc's source/man and the per-target sysroots (mkSysroot)
+  # are taken/cross-built from here, so every runner (x86_64/arm Linux, the Linux
+  # build host of the Windows cross, and macOS) produces them from source.
+  linuxPkgs = import pkgs.path { system = pkgs.stdenv.buildPlatform.system; };
   inherit (linuxPkgs.tinycc) src version;
 
   # Symbol-table tools. A Mach-O host renames symbols with --redefine-sym(s),
@@ -66,15 +57,70 @@ let
   objcopyBin = if isDarwin then "${llvmBin}/llvm-objcopy" else "$OBJCOPY";
   binName = if isWin then "tcc.exe" else "tcc";
 
+  # Each Linux target's sysroot (libc headers + crt + libc.a) is built HERE by one
+  # multi-target clang compiling musl from source — the zig-cc model. tcc itself
+  # can't build musl (no _Complex, only partial inline-asm/constraint support), and
+  # gcc would mean a full cross-gcc toolchain PER target (~30 min each, darwin
+  # included); clang is a single toolchain that retargets via --target=, so all
+  # five share it. The per-arch kernel UAPI headers (linux/, asm/, …) come from
+  # linuxHeaders — pure data, no compiler. The derivation runs on the build host
+  # and emits target machine code, so every host (Linux, the Windows cross's Linux
+  # build host, and macOS) produces real libc.a from source with no per-target gcc.
+  mkSysroot = { cross }:
+    let cp = linuxPkgs.pkgsCross.${cross};
+        triple = cp.stdenv.hostPlatform.config;
+    in linuxPkgs.stdenv.mkDerivation {
+      pname = "tcc-musl-sysroot-${triple}";
+      inherit (cp.musl) version src;
+      nativeBuildInputs = [ linuxPkgs.llvmPackages.clang-unwrapped linuxPkgs.llvm ];
+      dontConfigure = true;
+      # tcc's archive reader only understands a GNU `ar` (the symbol index is the
+      # member named `/`; tcc_load_alacarte fires on that name alone). A BSD/Darwin
+      # archive (first member `#1/20`, index `__.SYMDEF`) is opened and walked but
+      # NO member is ever pulled, so every libc symbol — first `__libc_start_main`,
+      # referenced by crt1.o — comes up undefined. On a macOS build host TWO things
+      # try to hand tcc a BSD archive, and BOTH must be defeated:
+      #   1. llvm-ar defaults to the build host's native format (BSD on darwin), so
+      #      `make` itself would write a BSD libc.a -> AR="llvm-ar --format=gnu".
+      #   2. nixpkgs' fixup strip phase re-archives every .a through cctools strip,
+      #      which rewrites the (now GNU) libc.a back to BSD -> dontStrip. (musl is
+      #      built without -g, so there is nothing to strip anyway.)
+      # Both are no-ops on a Linux host (already GNU, GNU strip preserves it).
+      dontStrip = true;
+      buildPhase = ''
+        runHook preBuild
+        CC="clang --target=${triple}" AR="llvm-ar --format=gnu" RANLIB=llvm-ranlib \
+          ./configure --target=${triple} --disable-shared --prefix=/
+        make -j''${NIX_BUILD_CORES:-1}
+        runHook postBuild
+      '';
+      installPhase = ''
+        runHook preInstall
+        make install DESTDIR=$out prefix=/
+        cp -aL ${cp.linuxHeaders}/include/. $out/include/   # kernel UAPI (per-arch)
+        chmod -R u+w $out/include
+        runHook postInstall
+      '';
+      # Guard the invariant tcc depends on: libc.a MUST stay a GNU archive (its
+      # 9th byte — first of member 1's name — is `/`, not `#`). Runs after fixup,
+      # so it catches any future host/strip regression that flips the format.
+      postFixup = ''
+        b=$(od -An -c -j8 -N1 $out/lib/libc.a | tr -d ' \n')
+        [ "$b" = "/" ] || { echo "ERROR: $out/lib/libc.a is not a GNU archive (byte8='$b'); tcc cannot read it"; exit 1; }
+      '';
+    };
+
   # Targets. `t` = tcc make-target / /zip subtree name; `g` = the C symbol tag
-  # (objcopy prefix + dispatch.c extern); `musl` = the cross musl supplying that
-  # ELF target's headers + crt*.o + libc.a.
-  linuxTargets = [
-    { t = "x86_64";  g = "x86_64";  musl = linuxPkgs.pkgsCross.musl64.pkgsStatic.musl; }
-    { t = "i386";    g = "i386";    musl = linuxPkgs.pkgsCross.musl32.pkgsStatic.musl; }
-    { t = "arm";     g = "arm";     musl = linuxPkgs.pkgsCross.armv7l-hf-multiplatform.pkgsStatic.musl; }
-    { t = "arm64";   g = "arm64";   musl = linuxPkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.musl; }
-    { t = "riscv64"; g = "riscv64"; musl = linuxPkgs.pkgsCross.riscv64-musl.pkgsStatic.musl; }
+  # (objcopy prefix + dispatch.c extern); `sysroot` = the clang-built musl tree
+  # (`/include` + `/lib`) supplying that ELF target's headers + crt*.o + libc.a.
+  # All five — riscv64 included — link clean once tcc's RISC-V reloc handler is
+  # taught clang's hoisted hi/lo scheme (the riscv64-link.c patch in commonPatch).
+  linuxTargets = map (e: e // { sysroot = mkSysroot { inherit (e) cross; }; }) [
+    { t = "x86_64";  g = "x86_64";  cross = "musl64"; }
+    { t = "i386";    g = "i386";    cross = "musl32"; }
+    { t = "arm";     g = "arm";     cross = "armv7l-hf-multiplatform"; }
+    { t = "arm64";   g = "arm64";   cross = "aarch64-multiplatform-musl"; }
+    { t = "riscv64"; g = "riscv64"; cross = "riscv64-musl"; }
   ];
   # Windows (PE): a Linux ELF tcc that emits x86_64 PE; its sysroot is the
   # in-tree win32/ mingw headers + .def import descriptors + a PE libtcc1.a (crt
@@ -211,13 +257,32 @@ let
     # i386: relocate the PLT for static EXEs (no PC32 collapse on i386).
     substituteInPlace tccelf.c \
       --replace-fail 'relocate_syms(s1, s1->symtab, 0);' 'if (!dynamic && s1->plt && file_type == TCC_OUTPUT_EXE) relocate_plt(s1); relocate_syms(s1, s1->symtab, 0);'
+
+    # riscv64: tcc pairs PCREL_HI20/LO12 through a single `last_hi` slot, assuming
+    # the relocs alternate HI,LO,HI,LO (as gcc emits). clang hoists/coalesces the
+    # `auipc`s — several HI20 before their LO12, one HI20 shared by several LO12 —
+    # so `last_hi` is the wrong HI by the time a LO12 arrives ("unsupported hi/lo
+    # pcrel reloc scheme"). Record every HI20 in a table and, on each LO12, refresh
+    # last_hi from the HI at address `val` (the LO12's target). A strict superset of
+    # the old behaviour: gcc's paired relocs still resolve. Needed so the riscv64
+    # backend links clang-built musl — keeping every target on the single clang.
+    substituteInPlace riscv64-link.c \
+      --replace-fail 'ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,' '
+    static struct pcrel_hi *rv_his; static int rv_his_n;
+    static void rv_rec_hi(addr_t a, addr_t v){ rv_his = tcc_realloc(rv_his, (rv_his_n+1)*sizeof(*rv_his)); rv_his[rv_his_n].addr = a; rv_his[rv_his_n].val = v; rv_his_n++; }
+    static int rv_find_hi(addr_t a){ int i; for (i = rv_his_n; --i >= 0; ) if (rv_his[i].addr == a) return i; return -1; }
+    ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,' \
+      --replace-fail 'last_hi.val = val;' 'last_hi.val = val; rv_rec_hi(addr, val);' \
+      --replace-fail 'if (val != last_hi.addr)' '{ int rvi = rv_find_hi(val); if (rvi >= 0) last_hi = rv_his[rvi]; } if (val != last_hi.addr)'
   '';
 in
 hostStdenv.mkDerivation {
   pname = "tcc";
   inherit version src;
   # zip/which run at build time → build-host tools (native in a cross build).
-  nativeBuildInputs = [ pkgs.buildPackages.zip pkgs.buildPackages.which ];
+  # perl (+ its pod2man) generates tcc.1 from tcc-doc.texi in-tree; zip/which run
+  # at build time. All build-host tools (native in a cross build).
+  nativeBuildInputs = [ pkgs.buildPackages.zip pkgs.buildPackages.which pkgs.buildPackages.perl ];
   buildInputs = hostSdk; # the host SDK on darwin (libSystem + libc headers); [] elsewhere
   postPatch = commonPatch;
 
@@ -243,7 +308,7 @@ hostStdenv.mkDerivation {
     # absolute INC-<t> dropped the {B}/include default, so feed the headers via
     # C_INCLUDE_PATH (musl per arch; in-tree mingw for PE; the SDK for osx).
     ${lib.concatMapStringsSep "\n    " (e:
-      "C_INCLUDE_PATH=${e.musl.dev}/include make ${e.t}-libtcc1.a $J ${pvLine e.t}"
+      "C_INCLUDE_PATH=${e.sysroot}/include make ${e.t}-libtcc1.a $J ${pvLine e.t}"
     ) linuxTargets}
     C_INCLUDE_PATH=$(pwd)/win32/include:$(pwd)/win32/include/winapi make ${winT}-libtcc1.a $J ${pvLine winT}
     ${lib.concatMapStringsSep "\n    " (e:
@@ -289,18 +354,16 @@ hostStdenv.mkDerivation {
 
     echo "=== assemble ONE zip with per-target sysroot subtrees ==="
     rm -rf zroot
-    mkLinux() {  # $1=target  $2=musl.dev  $3=musl.out
+    mkLinux() {  # $1=target  $2=sysroot (clang-built musl: include/ + lib/)
       mkdir -p zroot/$1/include zroot/$1/lib/tcc
-      # cp -aL: dereference. musl.dev/include reaches the kernel UAPI (linux/,
-      # drm/, asm/, …) through symlinks into a linux-headers store path; zip would
-      # silently follow them and bake five full copies, so materialise them as
-      # real files for the dedup pass to see and hoist.
+      # cp -aL: dereference any symlink (the kernel UAPI may link into a
+      # linux-headers store path) so the dedup pass sees real files to hoist.
       cp -aL $2/include/. zroot/$1/include/ && chmod -R u+w zroot/$1/include
       cp -af include/. zroot/$1/include/ && chmod -R u+w zroot/$1/include
-      cp -a $3/lib/crt1.o $3/lib/crti.o $3/lib/crtn.o $3/lib/libc.a zroot/$1/lib/
+      cp -a $2/lib/crt1.o $2/lib/crti.o $2/lib/crtn.o $2/lib/libc.a zroot/$1/lib/
       cp -a $1-libtcc1.a zroot/$1/lib/tcc/
     }
-    ${lib.concatMapStringsSep "\n    " (e: "mkLinux ${e.t} ${e.musl.dev} ${e.musl.out}") linuxTargets}
+    ${lib.concatMapStringsSep "\n    " (e: "mkLinux ${e.t} ${e.sysroot}") linuxTargets}
 
     # win32 subtree: mingw headers + tcc intrinsics + .def + PE libtcc1.a.
     mkdir -p zroot/${winT}/include zroot/${winT}/lib/tcc
@@ -355,10 +418,13 @@ BLOBEOF
   installPhase = ''
     runHook preInstall
     install -Dm755 ${binName} $out/bin/${binName}
-    # tcc.1 is host-independent roff; take it (uncompressed) from the fixed
-    # x86_64-linux tinycc so `unpin man tcc` works on every host (withMan embeds it).
-    mkdir -p $out/share/man/man1
-    gzip -dc ${linuxPkgs.tinycc.man}/share/man/man1/tcc.1.gz > $out/share/man/man1/tcc.1
+    # Generate tcc.1 from the in-tree texinfo doc (perl + pod2man) — host-independent
+    # roff built from source, so `unpin man tcc` works on every host (withMan embeds
+    # it). Avoids pulling nixpkgs' tinycc just for its man output, whose darwin build
+    # fails its own test suite.
+    perl texi2pod.pl tcc-doc.texi tcc-doc.pod
+    pod2man --section=1 --center="Tiny C Compiler" --release="tcc ${version}" tcc-doc.pod > tcc.1
+    install -Dm644 tcc.1 $out/share/man/man1/tcc.1
     runHook postInstall
   '';
 

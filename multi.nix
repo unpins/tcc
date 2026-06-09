@@ -24,8 +24,9 @@
 # so the `<t>-tcc` tools build with the build-host cc (`pkgs.buildPackages`) and
 # run here, while each `<t>-tcc.o` is recompiled with the host cc (`$CC`), since
 # it carries the compiler logic that runs on the host. The Linux target sysroots
-# are host-independent machine code, taken from a fixed x86_64-linux pkgs (so a
-# darwin host, where musl doesn't evaluate, still gets them).
+# are host-independent machine code; their derivations are sourced from the build
+# machine's own Linux pkgs (so each CI runner builds them natively), falling back
+# to x86_64-linux on a darwin host where musl doesn't evaluate.
 pkgs:
 let
   lib = pkgs.lib;
@@ -43,10 +44,19 @@ let
   buildAR = "${hp.buildPackages.stdenv.cc.bintools.bintools}/bin/ar";
 
   # Linux-target artifacts (tinycc source + the per-arch musl sysroots that
-  # become each ELF backend's headers/crt/libc.a) are host-independent, so take
-  # them from a fixed x86_64-linux pkgs: required on a darwin host, a cache hit
-  # elsewhere.
-  linuxPkgs = import pkgs.path { system = "x86_64-linux"; };
+  # become each ELF backend's headers/crt/libc.a) are host-independent machine
+  # code, but their *derivations* must build on the machine running this build.
+  # Source them from the build platform's own pkgs when it's Linux (so the arm CI
+  # runners produce aarch64-linux drvs they can build, the x86_64 runners produce
+  # x86_64-linux drvs); on a darwin host, where musl doesn't evaluate, fall back
+  # to x86_64-linux (built on the remote Linux builder / substituted from cache).
+  # Every target below is pinned to its arch via pkgsCross, so the chosen base's
+  # native arch never leaks into a backend's sysroot.
+  linuxSystem =
+    if pkgs.stdenv.buildPlatform.isLinux
+    then pkgs.stdenv.buildPlatform.system
+    else "x86_64-linux";
+  linuxPkgs = import pkgs.path { system = linuxSystem; };
   inherit (linuxPkgs.tinycc) src version;
 
   # Symbol-table tools. A Mach-O host renames symbols with --redefine-sym(s),
@@ -60,7 +70,7 @@ let
   # (objcopy prefix + dispatch.c extern); `musl` = the cross musl supplying that
   # ELF target's headers + crt*.o + libc.a.
   linuxTargets = [
-    { t = "x86_64";  g = "x86_64";  musl = linuxPkgs.pkgsStatic.musl; }
+    { t = "x86_64";  g = "x86_64";  musl = linuxPkgs.pkgsCross.musl64.pkgsStatic.musl; }
     { t = "i386";    g = "i386";    musl = linuxPkgs.pkgsCross.musl32.pkgsStatic.musl; }
     { t = "arm";     g = "arm";     musl = linuxPkgs.pkgsCross.armv7l-hf-multiplatform.pkgsStatic.musl; }
     { t = "arm64";   g = "arm64";   musl = linuxPkgs.pkgsCross.aarch64-multiplatform-musl.pkgsStatic.musl; }

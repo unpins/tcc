@@ -274,6 +274,24 @@ let
     ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,' \
       --replace-fail 'last_hi.val = val;' 'last_hi.val = val; rv_rec_hi(addr, val);' \
       --replace-fail 'if (val != last_hi.addr)' '{ int rvi = rv_find_hi(val); if (rvi >= 0) last_hi = rv_his[rvi]; } if (val != last_hi.addr)'
+
+    # libtcc1 is built by RUNNING each cross-tcc on the build host. tcc emits a
+    # long double CONSTANT by copying the host long double's bytes, which only
+    # works when the host long double is at least as wide as the target's
+    # (LDOUBLE_SIZE). On an aarch64-macOS build host long double is 64-bit, so for
+    # every target whose LDOUBLE_SIZE > 8 (x86_64/i386/arm64/riscv64 and x86_64-osx)
+    # tcc aborts libtcc1.c with "can't cross compile long double constants". The
+    # ONLY long double constant in libtcc1.c / lib-arm64.c is the implicit 0.0L of
+    # comparisons like `a1 >= 0` (verified: no other float-suffixed or negative-zero
+    # long double literal exists), and 0.0L is all-zero bytes on every target. So
+    # teach that path to recognise a zero value and write LDOUBLE_SIZE zero bytes
+    # rather than memcmp the (narrower) host bytes; any future NON-zero constant
+    # still hits the original error, loudly, instead of silently corrupting. This
+    # keeps libtcc1 fully tcc-built (correct codegen) on every host — clang can't
+    # substitute: tcc's i386 static linker mishandles clang's constant-pool relocs.
+    substituteInPlace tccgen.c \
+      --replace-fail 'else if (0 == memcmp(ptr, &vtop->c.ld, LDOUBLE_SIZE))' 'else if (vtop->c.ld == 0.0)' \
+      --replace-fail '; /* nothing to do for 0.0 */' 'memset(ptr, 0, LDOUBLE_SIZE); /* 0.0L is all-zero on every target; host long double may be narrower */'
   '';
 in
 hostStdenv.mkDerivation {

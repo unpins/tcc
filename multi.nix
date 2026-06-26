@@ -34,14 +34,40 @@ let
   isWin = hostPlat.isWindows;
   isDarwin = hostPlat.isDarwin;
 
-  # Host stdenv. Linux is static-musl (self-contained, `env -i`-clean, runs
-  # under qemu-user with no loader); Windows/macOS keep their cross stdenv as-is
-  # (the PE folds the crt via -static below; macOS has no static libc). `hp` also
-  # carries the build-host toolchain via `.buildPackages`.
-  hp = if isDarwin || isWin then pkgs else pkgs.pkgsStatic;
+  # Host stdenv. Linux AND macOS go through pkgsStatic, where mkStandaloneFlake's
+  # unpin-llvm engine swap lives (it activates for any isStatic||isMusl host) — so
+  # `$CC` is the engine clang and every host object comes out as LLVM bitcode, the
+  # prerequisite for the bitcode-LTO multicall module. On Linux that yields a fully
+  # static-musl binary; on macOS pkgsStatic is "soft static" (static libc++ +
+  # compiler-rt, libSystem still dynamic — a darwin host can't fully static-link),
+  # exactly the convention grep & every other engine package uses. Windows keeps
+  # its plain mingw cross set (off-engine; the PE folds the crt via -static below).
+  # `hp` also carries the build-host toolchain via `.buildPackages`.
+  hp = if isWin then pkgs else pkgs.pkgsStatic;
   hostStdenv = hp.stdenv;
-  buildCC = "${hp.buildPackages.stdenv.cc}/bin/cc";
-  buildAR = "${hp.buildPackages.stdenv.cc.bintools.bintools}/bin/ar";
+  buildCC_cc = hp.buildPackages.stdenv.cc;
+  # buildCC builds tcc's BUILD-TIME tools (c2str + the eight cross-tccs that run
+  # here to emit each libtcc1.a) — the vanilla build-host clang, never the engine.
+  # On a NATIVE darwin build (build == host), the engine's bare `ld` (ELF lld)
+  # shadows this cc's cctools ld64 on PATH because build & host share the same
+  # apple-darwin salt (the linux salt-separation collapses) → a build-time LINK
+  # sends ld64 args (-arch/-syslibroot/…) to ELF lld, which rejects them. Pin to
+  # the real cctools ld64 with --ld-path (only on link steps, so compiles don't
+  # warn) via a 1-line wrapper — a single token that drops cleanly into
+  # `--cc=`/`CC=`. Mirrors nix-lib's unpinBashBuildFix. Only on native darwin: in a
+  # cross (e.g. x86_64→aarch64 darwin) the salts differ so the build cc's ld64 is
+  # never shadowed, and writeShellScript would resolve a wrong-platform bash. Inert
+  # on linux. CI builds BOTH darwin arches natively, so each gets the wrapper.
+  isNativeDarwin =
+    isDarwin && pkgs.stdenv.buildPlatform.system == pkgs.stdenv.hostPlatform.system;
+  buildCC =
+    if isNativeDarwin
+    then "${pkgs.buildPackages.writeShellScript "tcc-build-cc" ''
+      for a in "$@"; do case "$a" in -c|-E|-S) exec ${buildCC_cc}/bin/cc "$@" ;; esac; done
+      exec ${buildCC_cc}/bin/cc --ld-path=${buildCC_cc.bintools.bintools}/bin/ld "$@"
+    ''}"
+    else "${buildCC_cc}/bin/cc";
+  buildAR = "${buildCC_cc.bintools.bintools}/bin/ar";
 
   # A pkgs native to the BUILD machine — darwin included, never a foreign system a
   # host can't build. tinycc's source/man and the per-target sysroots (mkSysroot)
@@ -139,24 +165,31 @@ let
   isOsx = lib.hasSuffix "-osx";
 
   # apple-sdk gives the macOS C headers (no /usr/include since 10.14) +
-  # libSystem.tbd. Reach it from any host by re-instantiating nixpkgs for darwin
-  # (eval-only; the SDK substitutes from cache). Both osx arches SHARE one
-  # /zip/osx tier — the SDK headers are byte-identical across arches and
-  # libSystem.tbd is a multi-arch stub; only the per-arch libtcc1.a differs. On a
-  # darwin host the dispatcher also links against the host's own SDK (libSystem +
-  # libc headers — the modern darwin stdenv carries none by default).
+  # libSystem.tbd for the embedded /zip/osx cross sysroot. Reach it from any host
+  # by re-instantiating nixpkgs for darwin (eval-only; the SDK substitutes from
+  # cache). Both osx arches SHARE one /zip/osx tier — the SDK headers are
+  # byte-identical across arches and libSystem.tbd is a multi-arch stub; only the
+  # per-arch libtcc1.a differs. This is the NATIVE (non-static) apple-sdk on
+  # purpose: `hp` is pkgsStatic on darwin, and `hp.apple-sdk` would be the
+  # apple-sdk-STATIC variant, whose Csu (crt) rebuild trips the engine's ld64.lld
+  # (no `ld -r`). The host's OWN SDK (for compiling the dispatcher + linking
+  # libSystem) is NOT needed as a buildInput: the engine darwin stdenv exports
+  # SDKROOT (-> the native apple-sdk) and `$CC` honours it as -isysroot, exactly
+  # like grep & every other engine package — so there is no apple-sdk buildInput.
   sdkRoot = (import pkgs.path { system = "aarch64-darwin"; }).apple-sdk.sdkroot;
-  hostSdk = lib.optional isDarwin hp.apple-sdk;
 
   # The host's executable format drives three knobs; vfs_miniz.c mirrors the same
   # three #if branches, so the blob symbol names must match the OS exactly:
-  #   ELF (Linux)    _binary_incblob_* ; GNU `ld --wrap` reroutes open/stat/… ;
-  #                  -static musl ; -ldl/-lpthread are tcc's glibc deps (musl stubs).
-  #   PE (Windows)   incblob_* ; mingw `ld --wrap=open` (tcc reads every input via
-  #                  open(), makes no stat on Windows) ; -static folds the crt.
-  #   Mach-O (macOS) _incblob_* ; ld64 has no --wrap, so the VFS binds by
-  #                  rewriting each object's open import to _unpinvfs_open (the
-  #                  redefine pass below) ; dynamic against libSystem.
+  #   ELF (Linux)    _binary_incblob_* ; the engine renames open/stat/… to
+  #                  unpinvfs_* in the IR (prefix() below) ; -static musl.
+  #   PE (Windows)   incblob_* ; mingw is off-engine, so `ld --wrap=open` reroutes
+  #                  (tcc reads every input via open(), never stat()s) ; -static
+  #                  folds the crt.
+  #   Mach-O (macOS) _incblob_* ; on the engine the VFS binds the same way as Linux
+  #                  (the IR rename), and the blob is emitted as a BITCODE object
+  #                  via module-level .incbin (see the link step) rather than this
+  #                  native `.S` ; dynamic against libSystem. (blobAsm's Mach-O case
+  #                  below is only for a hypothetical off-engine darwin.)
   blobAsm =
     if isWin then ''
       .section .rodata
@@ -301,7 +334,8 @@ hostStdenv.mkDerivation {
   # perl (+ its pod2man) generates tcc.1 from tcc-doc.texi in-tree; zip/which run
   # at build time. All build-host tools (native in a cross build).
   nativeBuildInputs = [ pkgs.buildPackages.zip pkgs.buildPackages.which pkgs.buildPackages.perl ];
-  buildInputs = hostSdk; # the host SDK on darwin (libSystem + libc headers); [] elsewhere
+  # No buildInputs: the host SDK (libSystem + libc headers) reaches darwin via the
+  # engine stdenv's SDKROOT, and the embedded /zip/osx tier comes from sdkRoot.
   postPatch = commonPatch;
 
   # configure with the BUILD-host cc: ./configure builds c2str (run at build
@@ -326,19 +360,28 @@ hostStdenv.mkDerivation {
     # mingw Windows cross, or a plain gcc build) keep the objcopy + --wrap path.
     # Probe rather than trust a platform flag, so a future off-engine build is
     # handled correctly. $MT is the engine multitool (opt/llvm-as), reached via
-    # the cc-wrapper's objcopy symlink (-> ''${toolchain}/bin/llvm).
+    # the cc-wrapper's objcopy symlink (-> ''${toolchain}/bin/llvm). The probe
+    # accepts BOTH bitcode magics the engine emits: raw `4243c0de` (linux) and
+    # its wrapper `dec0170b` (darwin wraps the bitcode in a thin header), matching
+    # the engine's own _unpin_natkind classifier — without the wrapper case the
+    # darwin build false-negatives to the objcopy path and the renamed mains come
+    # out wrong (`ld: _x86_64_main not found`).
     echo 'int _unpin_probe(void){return 0;}' > _probe.c
     $CC -c _probe.c -o _probe.o 2>/dev/null || true
-    if [ "$(od -An -tx1 -N4 _probe.o 2>/dev/null | tr -d ' \n')" = "4243c0de" ]; then
-      ENGINE=1
+    case "$(od -An -tx1 -N4 _probe.o 2>/dev/null | tr -d ' \n')" in
+      4243c0de|dec0170b) ENGINE=1 ;;
+      *) ENGINE=0 ;;
+    esac
+    if [ "$ENGINE" = 1 ]; then
       # The engine multitool (opt/internalize live here, as `<llvm> opt …`). The
       # adapter exposes nm/objcopy/ld.lld as SHELL SCRIPTS that `exec
       # <toolchain>/bin/llvm <subcmd> "$@"` (not symlinks, and $OBJCOPY is a
       # standalone llvm-objcopy), so neither readlink nor a subcommand-less
       # invocation reaches the bare driver. Recover its path by grepping the
-      # `/bin/llvm` literal out of one of those wrapper scripts.
+      # `/bin/llvm` literal out of one of those wrapper scripts — or, on darwin
+      # where nm/objcopy may be cctools, out of the cc/opt wrapper itself.
       MT=""
-      for __c in nm objcopy "$NM" "$OBJCOPY"; do
+      for __c in nm objcopy "$NM" "$OBJCOPY" "$CC" cc clang opt; do
         __f=$(readlink -f "$(command -v "$__c" 2>/dev/null)" 2>/dev/null) || continue
         [ -f "$__f" ] || continue
         __p=$(grep -aoE '/nix/store/[^ "]*/bin/llvm' "$__f" 2>/dev/null | head -1) || true
@@ -397,13 +440,23 @@ hostStdenv.mkDerivation {
     #   localizes everything but <g>_main, so the eight backends' identical libtcc
     #   API globals can't collide at the fold. `@sym` is a FUNCTION symbol and a
     #   type is `%struct.sym` (different sigil), so renaming @stat never touches
-    #   `struct stat`. In the IR there is no leading underscore on any target, so
-    #   the rename is uniform across the Linux and macOS backends; the Mach-O `_`
-    #   is added only at object emission, matching dispatch.c's externs.
-    # OFF-ENGINE (PE/ELF objects): nm + objcopy --redefine-syms prefixes every
-    #   defined global; the VFS binds with --wrap (added at link). Mach-O would
-    #   need its leading-underscore variant, but darwin only ever takes the
-    #   ENGINE path here, so the objcopy branch is the ELF/PE (mingw) one.
+    #   `struct stat`. The Mach-O `_` is added only at object emission, matching
+    #   dispatch.c's externs. The libc IMPORT names differ by target, though:
+    #   Linux IR names them plainly (`@open`, `@stat`), but darwin's SDK headers
+    #   give them raw-symbol asm labels — `@"\01_open"`, and the 64-bit-inode
+    #   `@"\01_stat$INODE64"` / `@"\01_lstat$INODE64"` — so the VFS rename needs a
+    #   second set of rules for those, or the rename silently no-ops and LTO drops
+    #   the now-unreferenced unpinvfs_* (tcc then reads the real FS, not /zip).
+    #   Each rule that can't match a given target's IR is a harmless no-op there,
+    #   so all rules run on every target and the Linux output stays byte-identical.
+    # OFF-ENGINE (PE on the mingw Windows cross — the only off-engine host now;
+    #   the awk underscore-strip branch and the _open rewrite below stay only for a
+    #   hypothetical off-engine darwin): nm + objcopy --redefine-syms prefixes every
+    #   defined global. On Mach-O every C symbol carries a leading underscore
+    #   (main -> _main), so the rename inserts the tag AFTER it (_main ->
+    #   _x86_64_osx_main) to match dispatch.c's (also-underscored) externs; ELF/PE
+    #   have no leading underscore. The VFS binds with --wrap on PE; on Mach-O ld64
+    #   has no --wrap, so a post-pass rewrites each object's _open import.
     prefix() {  # $1 = target stem   $2 = C symbol tag (g)
       if [ "$ENGINE" = 1 ]; then
         $MT opt -S $1-tcc.o -o $1.ll
@@ -417,15 +470,34 @@ hostStdenv.mkDerivation {
           -e 's/@__lstat_time64\b/@unpinvfs_lstat/g' \
           -e 's/@"\\01__stat_time64"/@unpinvfs_stat/g' \
           -e 's/@"\\01__lstat_time64"/@unpinvfs_lstat/g' \
+          -e 's/@"\\01_open"/@unpinvfs_open/g' \
+          -e 's/@"\\01_access"/@unpinvfs_access/g' \
+          -e 's/@"\\01_stat\$INODE64"/@unpinvfs_stat/g' \
+          -e 's/@"\\01_lstat\$INODE64"/@unpinvfs_lstat/g' \
           $1.ll
         $MT opt -passes=internalize -internalize-public-api-list="$2"_main $1.ll -o $2-pfx.o
       else
-        ${nmBin} -g --defined-only $1-tcc.o | awk -v p=$2 '{print $NF, p"_"$NF}' > $2.map
+        ${nmBin} -g --defined-only $1-tcc.o | awk -v p=$2 ${
+          if isDarwin
+          then "'{s=$NF; sub(/^_/,\"\",s); print $NF, \"_\" p \"_\" s}'"
+          else "'{print $NF, p\"_\"$NF}'"} > $2.map
         ${objcopyBin} --redefine-syms=$2.map $1-tcc.o $2-pfx.o
       fi
     }
     ${lib.concatMapStringsSep "\n    " (e: "prefix ${e.t} ${e.g}") (linuxTargets ++ osxTargets)}
     prefix ${winT} ${winG}
+    ${lib.optionalString isDarwin ''
+      # Mach-O VFS bind for an OFF-ENGINE darwin build (objcopy path): rewrite each
+      # backend object's open() import to _unpinvfs_open. Dead on the engine — there
+      # the sed pass already renamed @open -> @unpinvfs_open in the IR, and objcopy
+      # can't touch bitcode anyway — so guard it on ENGINE=0. darwin now always goes
+      # through the engine (pkgsStatic), so this only fires if that ever regresses.
+      if [ "$ENGINE" = 0 ]; then
+        for o in ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") (linuxTargets ++ osxTargets)} ${winG}-pfx.o; do
+          ${objcopyBin} --redefine-sym _open=_unpinvfs_open "$o"
+        done
+      fi
+    ''}
 
     echo "=== assemble ONE zip with per-target sysroot subtrees ==="
     rm -rf zroot
@@ -474,14 +546,40 @@ hostStdenv.mkDerivation {
     [ -f incblob ] || mv incblob.zip incblob
 
     echo "=== blob + VFS + dispatcher → link ONE binary (host=${hostPlat.system}) ==="
-    cat > blob.S <<'BLOBEOF'
+    ${if isDarwin then ''
+      # Darwin: emit the blob as a BITCODE object (engine `$CC` adds -flto), NOT a
+      # native Mach-O `.S`. The engine bintools `ld` is hardcoded to ELF `ld.lld`,
+      # which LTO-compiles darwin bitcode into Mach-O fine (so a pure-bitcode link
+      # links clean — this is how grep links) but CANNOT read a pre-existing native
+      # Mach-O object, and the multitool's `ld64.lld` LTO path falls back to ELF
+      # mode when bitcode is mixed with one. Wrapping the `.incbin` in module-level
+      # __asm__ keeps the blob in the bitcode so the whole link stays pure bitcode —
+      # no linker override needed. The `.incbin` is resolved at LTO codegen (link
+      # time); the link runs from this dir, so the RELATIVE `incblob` path resolves
+      # and no build-sandbox path leaks into the bitcode.
+      cat > blob.c <<'BLOBEOF'
+__asm__(
+".section __TEXT,__const\n"
+".globl _incblob_start\n"
+".globl _incblob_end\n"
+"_incblob_start:\n"
+".incbin \"incblob\"\n"
+"_incblob_end:\n"
+);
+BLOBEOF
+      $CC -O2 -c blob.c -o blob.o
+    '' else ''
+      cat > blob.S <<'BLOBEOF'
 ${blobAsm}
 BLOBEOF
-    $CC -c blob.S -o blob.o
+      $CC -c blob.S -o blob.o
+    ''}
     $CC -O2 -c miniz.c -o miniz.o
     $CC -O2 -I. $VFSDEF -c vfs_miniz.c -o vfs_miniz.o
     $CC -O2 -c ${./src}/dispatch.c -o dispatch.o
 
+    # One LTO link. On darwin everything is bitcode (blob included, above), so the
+    # engine's ELF ld.lld LTO-compiles it straight to Mach-O — no linker override.
     $CC ${staticFlag} -o ${binName} dispatch.o \
       ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") linuxTargets} ${winG}-pfx.o \
       ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") osxTargets} \

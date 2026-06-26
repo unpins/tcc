@@ -23,6 +23,12 @@
     in ulib.mkStandaloneFlake {
       inherit self;
       name = "tcc";
+
+      # Build via the unpin-llvm engine + emit a bitcode multicall module.
+      engine = "unpin-llvm";
+      multicall = {
+        programs = [{ name = "tcc"; }];
+      };
       # nixpkgs ships TinyCC as `tinycc`; used for the man page + license.
       pkgsAttr = "tinycc";
       license = "LGPL-2.1-only";

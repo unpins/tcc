@@ -243,8 +243,10 @@ static int write_all(int fd, const unsigned char *data, size_t len) {
     return 0;
 }
 
+/* anon_fd: a fresh anonymous SEEKABLE fd — platform-specific, INDEPENDENT of the
+ * VFS binding below. Linux has a real anonymous kernel fd (memfd); macOS has no
+ * memfd, so a temp file unlinked immediately. */
 #if defined(__APPLE__)
-/* macOS: no memfd -- temp file, unlink immediately => anonymous seekable fd. */
 #include <stdio.h>
 #include <sys/syscall.h>
 static int anon_fd(const unsigned char *data, size_t len) {
@@ -257,6 +259,30 @@ static int anon_fd(const unsigned char *data, size_t len) {
     if (write_all(fd, data, len) < 0) { close(fd); return -1; }
     return fd;
 }
+#else
+#include <sys/syscall.h>
+static int anon_fd(const unsigned char *data, size_t len) {
+    int fd = (int)syscall(SYS_memfd_create, "unpinvfs", 0u);
+    if (fd < 0) return -1;
+    if (write_all(fd, data, len) < 0) { close(fd); return -1; }
+    return fd;
+}
+#endif
+
+/* VFS binding — how a backend's open/stat/lstat/access reach the VFS:
+ *   rename  (unpinvfs_*): the backend objects' open/stat/lstat/access symbols are
+ *     renamed to unpinvfs_*, so this TU NAMES its interceptors unpinvfs_* and
+ *     calls the GENUINE libc directly. No linker-global `--wrap`, so it never
+ *     reroutes any OTHER applet's open — the only binding safe to fold into the
+ *     unpinbox mega. Used on macOS (objcopy renames the Mach-O imports; ld64 has
+ *     no --wrap) AND on the bitcode engine path (the IR symbols are rewritten,
+ *     -DUNPIN_VFS_NOWRAP), where stat is mega-safe and 32-bit musl's
+ *     __stat_time64/__lstat_time64 are renamed to unpinvfs_stat/lstat too.
+ *   --wrap  (__wrap_*): a standalone GNU-ld link passes -Wl,--wrap=open,… so
+ *     __wrap_* intercept and __real_* are the genuine libc fns. NOT mega-safe.
+ * REAL_* therefore call the real libc plainly under rename (this TU is never
+ * renamed) and via __real_* under --wrap. */
+#if defined(__APPLE__) || defined(UNPIN_VFS_NOWRAP)
 #  define OPEN_FN    unpinvfs_open
 #  define STAT_FN    unpinvfs_stat
 #  define LSTAT_FN   unpinvfs_lstat
@@ -266,18 +292,10 @@ static int anon_fd(const unsigned char *data, size_t len) {
 #  define REAL_LSTAT(p, s)    lstat((p), (s))
 #  define REAL_ACCESS(p, m)   access((p), (m))
 #else
-/* Linux: a real anonymous kernel fd. */
-#include <sys/syscall.h>
 extern int __real_open(const char *path, int flags, ...);
 extern int __real_stat(const char *path, struct stat *st);
 extern int __real_lstat(const char *path, struct stat *st);
 extern int __real_access(const char *path, int mode);
-static int anon_fd(const unsigned char *data, size_t len) {
-    int fd = (int)syscall(SYS_memfd_create, "unpinvfs", 0u);
-    if (fd < 0) return -1;
-    if (write_all(fd, data, len) < 0) { close(fd); return -1; }
-    return fd;
-}
 #  define OPEN_FN    __wrap_open
 #  define STAT_FN    __wrap_stat
 #  define LSTAT_FN   __wrap_lstat
@@ -353,13 +371,16 @@ int ACCESS_FN(const char *path, int mode) {
     return REAL_ACCESS(path, mode);
 }
 
-#ifdef UNPIN_WRAP_TIME64
+#if defined(UNPIN_WRAP_TIME64) && !defined(UNPIN_VFS_NOWRAP)
 /* 32-bit musl (armv7l, i686, ...) is _REDIR_TIME64: <sys/stat.h> renames stat/
  * lstat to __stat_time64/__lstat_time64 via an __asm__ label, so perl's stat()
  * call references THOSE symbols, not `stat`. --wrap=stat then wraps a symbol
  * nobody calls and the real statx escapes the VFS. Wrap the time64 names too
  * (struct stat is already the time64 layout on these arches, so fill_stat is
- * correct). Linux-only; passed via -DUNPIN_WRAP_TIME64 for 32-bit hosts. */
+ * correct). Linux-only; passed via -DUNPIN_WRAP_TIME64 for 32-bit hosts.
+ * The NOWRAP (rename) binding handles these by rewriting the backend's
+ * __stat_time64/__lstat_time64 IR symbols straight to unpinvfs_stat/lstat, so
+ * this --wrap-only shim is compiled out there. */
 extern int __real___stat_time64(const char *path, struct stat *st);
 extern int __real___lstat_time64(const char *path, struct stat *st);
 

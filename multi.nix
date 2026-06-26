@@ -317,6 +317,43 @@ hostStdenv.mkDerivation {
     runHook preBuild
     J=-j''${NIX_BUILD_CORES:-1}
 
+    # The unpin-llvm engine compiles every host object to LLVM BITCODE (it
+    # appends -flto), the prerequisite for folding tcc into the bitcode-LTO
+    # unpinbox mega. objcopy can't rename symbols in bitcode, and the mega link
+    # can't carry tcc's per-package `--wrap`, so on the engine we bind the VFS
+    # and de-collide the eight backends by REWRITING IR symbols instead (see the
+    # prefix() ENGINE branch + -DUNPIN_VFS_NOWRAP below). Off the engine (the
+    # mingw Windows cross, or a plain gcc build) keep the objcopy + --wrap path.
+    # Probe rather than trust a platform flag, so a future off-engine build is
+    # handled correctly. $MT is the engine multitool (opt/llvm-as), reached via
+    # the cc-wrapper's objcopy symlink (-> ''${toolchain}/bin/llvm).
+    echo 'int _unpin_probe(void){return 0;}' > _probe.c
+    $CC -c _probe.c -o _probe.o 2>/dev/null || true
+    if [ "$(od -An -tx1 -N4 _probe.o 2>/dev/null | tr -d ' \n')" = "4243c0de" ]; then
+      ENGINE=1
+      # The engine multitool (opt/internalize live here, as `<llvm> opt …`). The
+      # adapter exposes nm/objcopy/ld.lld as SHELL SCRIPTS that `exec
+      # <toolchain>/bin/llvm <subcmd> "$@"` (not symlinks, and $OBJCOPY is a
+      # standalone llvm-objcopy), so neither readlink nor a subcommand-less
+      # invocation reaches the bare driver. Recover its path by grepping the
+      # `/bin/llvm` literal out of one of those wrapper scripts.
+      MT=""
+      for __c in nm objcopy "$NM" "$OBJCOPY"; do
+        __f=$(readlink -f "$(command -v "$__c" 2>/dev/null)" 2>/dev/null) || continue
+        [ -f "$__f" ] || continue
+        __p=$(grep -aoE '/nix/store/[^ "]*/bin/llvm' "$__f" 2>/dev/null | head -1) || true
+        [ -n "$__p" ] && { MT=$__p; break; }
+      done
+      [ -n "$MT" ] || { echo "tcc multi.nix: could not locate the engine llvm multitool" >&2; exit 1; }
+      VFSDEF=-DUNPIN_VFS_NOWRAP
+      WRAPFLAGS=""
+    else
+      ENGINE=0
+      VFSDEF=""
+      WRAPFLAGS="${wrapFlags}"
+    fi
+    echo "ENGINE=$ENGINE MT=''${MT:-} VFSDEF=$VFSDEF"
+
     echo "=== build the eight ONE_SOURCE cross-compilers (build-host cc; run here) ==="
     make ${lib.concatMapStringsSep " " (t: "${t}-tcc") allTargets} $J ${allPv} CC=${buildCC}
 
@@ -348,27 +385,47 @@ hostStdenv.mkDerivation {
     echo "host objects:"; file ${lib.concatMapStringsSep " " (t: "${t}-tcc.o") allTargets}
 
     echo "=== prefix every defined global per target (collision-free in-process) ==="
-    # nm/objcopy are host tools (stdenv binutils, or LLVM on a Mach-O host). On
-    # Mach-O every C symbol carries a leading underscore (main -> _main), so the
-    # rename inserts the tag AFTER it (_main -> _x86_64_osx_main) to match
-    # dispatch.c's (also-underscored) externs; ELF/PE have no leading underscore.
-    prefix() {  # $1 = object stem   $2 = C symbol tag
-      ${if isDarwin
-        then ''${nmBin} -g --defined-only $1-tcc.o | awk -v p=$2 '{s=$NF; sub(/^_/,"",s); print $NF, "_" p "_" s}' > $2.map''
-        else ''${nmBin} -g --defined-only $1-tcc.o | awk -v p=$2 '{print $NF, p"_"$NF}' > $2.map''}
-      ${objcopyBin} --redefine-syms=$2.map $1-tcc.o $2-pfx.o
+    # Each backend is the SAME ONE_SOURCE compile, so all eight define `main` +
+    # the ~34 libtcc API globals identically. To link them into one binary every
+    # backend's globals must be made unique, and each backend's open/stat/lstat/
+    # access must reach the VFS.
+    #
+    # ENGINE (bitcode): rewrite IR symbols (opt -S -> sed on the .ll -> opt). The
+    #   dispatcher calls eight distinct mains, so main -> <g>_main; the VFS binds
+    #   by rename (mega-safe, no --wrap), so open/stat/lstat/access -> unpinvfs_*
+    #   (incl. 32-bit musl's __stat_time64/__lstat_time64). Then opt -internalize
+    #   localizes everything but <g>_main, so the eight backends' identical libtcc
+    #   API globals can't collide at the fold. `@sym` is a FUNCTION symbol and a
+    #   type is `%struct.sym` (different sigil), so renaming @stat never touches
+    #   `struct stat`. In the IR there is no leading underscore on any target, so
+    #   the rename is uniform across the Linux and macOS backends; the Mach-O `_`
+    #   is added only at object emission, matching dispatch.c's externs.
+    # OFF-ENGINE (PE/ELF objects): nm + objcopy --redefine-syms prefixes every
+    #   defined global; the VFS binds with --wrap (added at link). Mach-O would
+    #   need its leading-underscore variant, but darwin only ever takes the
+    #   ENGINE path here, so the objcopy branch is the ELF/PE (mingw) one.
+    prefix() {  # $1 = target stem   $2 = C symbol tag (g)
+      if [ "$ENGINE" = 1 ]; then
+        $MT opt -S $1-tcc.o -o $1.ll
+        sed -i \
+          -e 's/@main\b/@'"$2"'_main/g' \
+          -e 's/@open\b/@unpinvfs_open/g' \
+          -e 's/@stat\b/@unpinvfs_stat/g' \
+          -e 's/@lstat\b/@unpinvfs_lstat/g' \
+          -e 's/@access\b/@unpinvfs_access/g' \
+          -e 's/@__stat_time64\b/@unpinvfs_stat/g' \
+          -e 's/@__lstat_time64\b/@unpinvfs_lstat/g' \
+          -e 's/@"\\01__stat_time64"/@unpinvfs_stat/g' \
+          -e 's/@"\\01__lstat_time64"/@unpinvfs_lstat/g' \
+          $1.ll
+        $MT opt -passes=internalize -internalize-public-api-list="$2"_main $1.ll -o $2-pfx.o
+      else
+        ${nmBin} -g --defined-only $1-tcc.o | awk -v p=$2 '{print $NF, p"_"$NF}' > $2.map
+        ${objcopyBin} --redefine-syms=$2.map $1-tcc.o $2-pfx.o
+      fi
     }
     ${lib.concatMapStringsSep "\n    " (e: "prefix ${e.t} ${e.g}") (linuxTargets ++ osxTargets)}
     prefix ${winT} ${winG}
-    ${lib.optionalString isDarwin ''
-      # Mach-O host: bind the VFS by rewriting each backend object's open() import
-      # to _unpinvfs_open (vfs_miniz.c's __APPLE__ branch defines it and calls the
-      # real libc open). tcc reads all input via open() and never stat()s a /zip
-      # path, so rerouting _open alone is the whole VFS.
-      for o in ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") (linuxTargets ++ osxTargets)} ${winG}-pfx.o; do
-        ${objcopyBin} --redefine-sym _open=_unpinvfs_open "$o"
-      done
-    ''}
 
     echo "=== assemble ONE zip with per-target sysroot subtrees ==="
     rm -rf zroot
@@ -422,14 +479,14 @@ ${blobAsm}
 BLOBEOF
     $CC -c blob.S -o blob.o
     $CC -O2 -c miniz.c -o miniz.o
-    $CC -O2 -I. -c vfs_miniz.c -o vfs_miniz.o
+    $CC -O2 -I. $VFSDEF -c vfs_miniz.c -o vfs_miniz.o
     $CC -O2 -c ${./src}/dispatch.c -o dispatch.o
 
     $CC ${staticFlag} -o ${binName} dispatch.o \
       ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") linuxTargets} ${winG}-pfx.o \
       ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") osxTargets} \
       blob.o vfs_miniz.o miniz.o \
-      ${wrapFlags} ${linkLibs}
+      $WRAPFLAGS ${linkLibs}
     runHook postBuild
   '';
 

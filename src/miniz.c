@@ -4508,8 +4508,12 @@ mz_bool mz_zip_reader_extract_to_mem_no_alloc1(mz_zip_archive *pZip, mz_uint fil
     if (file_stat.m_bit_flag & (MZ_ZIP_GENERAL_PURPOSE_BIT_FLAG_IS_ENCRYPTED | MZ_ZIP_GENERAL_PURPOSE_BIT_FLAG_USES_STRONG_ENCRYPTION | MZ_ZIP_GENERAL_PURPOSE_BIT_FLAG_COMPRESSED_PATCH_FLAG))
         return mz_zip_set_error(pZip, MZ_ZIP_UNSUPPORTED_ENCRYPTION);
 
-    /* This function only supports decompressing stored and deflate. */
-    if ((!(flags & MZ_ZIP_FLAG_COMPRESSED_DATA)) && (file_stat.m_method != 0) && (file_stat.m_method != MZ_DEFLATED))
+    /* This function only supports decompressing stored and deflate (+zstd). */
+    if ((!(flags & MZ_ZIP_FLAG_COMPRESSED_DATA)) && (file_stat.m_method != 0) && (file_stat.m_method != MZ_DEFLATED)
+#ifdef MINIZ_USE_ZSTD
+        && (file_stat.m_method != MZ_ZSTD_METHOD)
+#endif
+       )
         return mz_zip_set_error(pZip, MZ_ZIP_UNSUPPORTED_METHOD);
 
     /* Ensure supplied output buffer is large enough. */
@@ -4545,6 +4549,49 @@ mz_bool mz_zip_reader_extract_to_mem_no_alloc1(mz_zip_archive *pZip, mz_uint fil
 
         return MZ_TRUE;
     }
+
+#ifdef MINIZ_USE_ZSTD
+    if (file_stat.m_method == MZ_ZSTD_METHOD)
+    {
+        /* zstd entry: the whole frame is contiguous at cur_file_ofs, so decode
+         * it in one shot (no streaming). For an in-memory archive -- the VFS
+         * case -- point straight into the mapped blob; otherwise pull the frame
+         * into a scratch buffer first. */
+        const mz_uint8 *pSrc;
+        mz_uint8 *pTmp = NULL;
+        size_t got, src_len = (size_t)file_stat.m_comp_size;
+
+        if (pZip->m_pState->m_pMem)
+        {
+            pSrc = (const mz_uint8 *)pZip->m_pState->m_pMem + cur_file_ofs;
+        }
+        else
+        {
+            if (NULL == (pTmp = (mz_uint8 *)pZip->m_pAlloc(pZip->m_pAlloc_opaque, 1, src_len)))
+                return mz_zip_set_error(pZip, MZ_ZIP_ALLOC_FAILED);
+            if (pZip->m_pRead(pZip->m_pIO_opaque, cur_file_ofs, pTmp, src_len) != src_len)
+            {
+                pZip->m_pFree(pZip->m_pAlloc_opaque, pTmp);
+                return mz_zip_set_error(pZip, MZ_ZIP_FILE_READ_FAILED);
+            }
+            pSrc = pTmp;
+        }
+
+        got = unpin_zstd_decompress(pBuf, (size_t)file_stat.m_uncomp_size, pSrc, src_len);
+
+        if (pTmp)
+            pZip->m_pFree(pZip->m_pAlloc_opaque, pTmp);
+
+        if (got != (size_t)file_stat.m_uncomp_size)
+            return mz_zip_set_error(pZip, MZ_ZIP_DECOMPRESSION_FAILED);
+
+#ifndef MINIZ_DISABLE_ZIP_READER_CRC32_CHECKS
+        if (mz_crc32(MZ_CRC32_INIT, (const mz_uint8 *)pBuf, (size_t)file_stat.m_uncomp_size) != file_stat.m_crc32)
+            return mz_zip_set_error(pZip, MZ_ZIP_CRC_CHECK_FAILED);
+#endif
+        return MZ_TRUE;
+    }
+#endif /* MINIZ_USE_ZSTD */
 
     /* Decompress the file either directly from memory or from a file input buffer. */
     tinfl_init(&inflator);
@@ -6344,7 +6391,10 @@ mz_bool mz_zip_writer_add_mem_ex_v2(mz_zip_archive *pZip, const char *pArchive_n
 
     if (!store_data_uncompressed || (level_and_flags & MZ_ZIP_FLAG_COMPRESSED_DATA))
     {
-        method = MZ_DEFLATED;
+        /* unpin: caller-supplied pre-compressed bytes (MZ_ZIP_FLAG_COMPRESSED_DATA)
+           are labelled zstd (method 93) when MZ_ZIP_FLAG_ZSTD_DATA is also set;
+           otherwise deflate, exactly as before. */
+        method = (level_and_flags & MZ_ZIP_FLAG_ZSTD_DATA) ? MZ_ZSTD_METHOD : MZ_DEFLATED;
     }
 
     if (pState->m_zip64)

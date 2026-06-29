@@ -258,6 +258,15 @@ enum
 /* Method */
 #define MZ_DEFLATED 8
 
+/* unpin: ZIP compression method 93 = Zstandard (PKWARE APPNOTE 6.3.7). The
+ * patched reader/writer accept it when built with -DMINIZ_USE_ZSTD; the actual
+ * decode/encode is delegated to the unpin_zstd.h shim (miniz never sees
+ * <zstd.h>). Entries stay structurally a valid .zip. */
+#define MZ_ZSTD_METHOD 93
+#ifdef MINIZ_USE_ZSTD
+#include "unpin_zstd.h"
+#endif
+
 /* Heap allocation callbacks.
 Note that mz_alloc_func parameter types purposely differ from zlib's: items/size is size_t, not unsigned long. */
 typedef void *(*mz_alloc_func)(void *opaque, size_t items, size_t size);
@@ -1074,7 +1083,11 @@ typedef enum {
     MZ_ZIP_FLAG_ASCII_FILENAME = 0x10000,
     /*After adding a compressed file, seek back
     to local file header and set the correct sizes*/
-    MZ_ZIP_FLAG_WRITE_HEADER_SET_SIZE = 0x20000
+    MZ_ZIP_FLAG_WRITE_HEADER_SET_SIZE = 0x20000,
+    /* unpin: like MZ_ZIP_FLAG_COMPRESSED_DATA (caller supplies pre-compressed
+       bytes + uncomp_size + crc), but label the entry method 93 (zstd) instead
+       of deflate. Used by the packer to write zstd-in-zip entries. */
+    MZ_ZIP_FLAG_ZSTD_DATA = 0x40000
 } mz_zip_flags;
 
 typedef enum {

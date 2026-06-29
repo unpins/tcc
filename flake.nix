@@ -28,6 +28,13 @@
       engine = "unpin-llvm";
       multicall = {
         programs = [{ name = "tcc"; }];
+        # The darwin module keeps `.incbin "incblob"` (the embedded sysroot zip)
+        # unresolved in bitcode — the engine's ELF ld.lld can't mix a native
+        # Mach-O blob with bitcode, so darwin compiles the blob as bitcode and the
+        # `.incbin` codegens at the mega-link. nix-lib stages this file into the
+        # link CWD so that relative path resolves; linux/windows resolve it at
+        # compile time (native object in module_native.a) and ignore this.
+        linkData = [ "incblob" ];
       };
       # nixpkgs ships TinyCC as `tinycc`; used for the man page + license.
       pkgsAttr = "tinycc";

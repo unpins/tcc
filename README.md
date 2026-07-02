@@ -97,3 +97,8 @@ The [Releases](https://github.com/unpins/tcc/releases) page has standalone binar
   (the kernel UAPI; only `asm/` and `bits/` truly differ). The shared files are
   hoisted into one tier searched after each per-arch tier — Zig's trick for
   `zig cc` — so the embedded headers don't grow with the target count.
+- **Tests.** upstream tcc's `make test` targets a conventional single-target
+  build, not this eight-backend fold, so it isn't wired. Verification is instead
+  end-to-end: the release build compiles and runs a program for the native
+  target (and cross-compiles a Windows PE / macOS Mach-O), exercising the folded
+  backends and the embedded sysroots.

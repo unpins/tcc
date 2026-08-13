@@ -26,6 +26,7 @@
 # FORMAT (ELF / PE / Mach-O) for the VFS binding (rename on the bitcode engine,
 # `--wrap=open` on the off-engine mingw PE) and the link tail; the eight TARGETS
 # and the embedded sysroot tree are identical everywhere.
+{ vfsCore }:
 pkgs:
 let
   lib = pkgs.lib;
@@ -522,10 +523,10 @@ hostStdenv.mkDerivation {
     ''}
 
     echo "=== compile the shared unpin-vfs core (self-EOF) + dispatcher ==="
-    # Vendored unpin-vfs core; -I. so vfs.c finds miniz.h/vfs.h/unpin_zstd.h, and
-    # unpin_zstd.c #includes zstddeclib.c (decompress-only, -DUNPIN_ZSTD_VENDORED).
-    cp ${./src}/vfs.c ${./src}/vfs.h ${./src}/miniz.c ${./src}/miniz.h \
-       ${./src}/unpin_zstd.c ${./src}/unpin_zstd.h ${./src}/zstddeclib.c .
+    # unpin-vfs core, shared from nix-lib; -I. so vfs.c finds miniz.h/vfs.h/
+    # unpin_zstd.h, and unpin_zstd.c #includes zstddeclib.c (decompress-only,
+    # -DUNPIN_ZSTD_VENDORED).
+    cp ${vfsCore}/*.c ${vfsCore}/*.h .
     MZ='-DMINIZ_USE_ZSTD -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITING_APIS -DMINIZ_NO_ZLIB_APIS -DMINIZ_NO_ZLIB_COMPATIBLE_NAMES'
     $CC -O2 -I. $MZ -w -c miniz.c -o miniz.o
     $CC -O2 -I. -DMINIZ_USE_ZSTD -DUNPIN_ZSTD_VENDORED -w -c unpin_zstd.c -o unpin_zstd.o

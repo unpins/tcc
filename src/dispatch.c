@@ -9,8 +9,8 @@
  * arm64_main / riscv64_main / win32_main / x86_64_osx_main / arm64_osx_main).
  * All are linked into this one binary; the dispatcher just CALLS the right entry
  * in-process -- no child process, no fexecve, one libc, one VFS. Each target's
- * sysroot lives in its own /zip/<target>/ subtree, served by a shared
- * --wrap=open VFS.
+ * sysroot lives in its own /zip/<target>/ subtree, served by the shared
+ * unpin-vfs core.
  *
  * Target on the command line. Names follow the project's arch-os convention —
  * the exact spellings of the nix systems and release assets, and the ONLY ones

@@ -41,6 +41,9 @@
       # Build via the unpin-llvm engine + emit a bitcode multicall module.
       engine = "unpin-llvm";
       multicall = {
+        # The `.exe` on the engine too, not the nixpkgs mingw-gcc cross. The VFS
+        # then binds by rename there as well — see multi.nix's VFSBIND.
+        windows = true;
         programs = [{ name = "tcc"; }];
         # Merge tcc's /zip sysroot tree into the mega's EOF ZIP (like file's
         # magic.mgc). No `.incbin`/blob, so nothing is left unresolved in the

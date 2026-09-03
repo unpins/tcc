@@ -22,10 +22,10 @@
 # `pkgs` is the HOST pkgs set — the system the binary itself runs on.
 # mkStandaloneFlake hands a different one per catalog system (native, a musl
 # cross set for the other Linux archs, a darwin set; flake.nix's windowsBuild
-# supplies the mingw set). The host binary branches on the host's executable
-# FORMAT (ELF / PE / Mach-O) for the VFS binding (rename on the bitcode engine,
-# `--wrap=open` on the off-engine mingw PE) and the link tail; the eight TARGETS
-# and the embedded sysroot tree are identical everywhere.
+# supplies the mingw set). The host binary probes the OBJECT FORMAT it is being
+# compiled to (bitcode = engine) for the VFS binding — rename on the engine,
+# `--wrap=open` off it — and the host format (ELF / PE / Mach-O) for the link
+# tail; the eight TARGETS and the embedded sysroot tree are identical everywhere.
 { vfsCore, vfsBindFns }:
 pkgs:
 let
@@ -40,8 +40,9 @@ let
   # prerequisite for the bitcode-LTO multicall module. On Linux that yields a fully
   # static-musl binary; on macOS pkgsStatic is "soft static" (static libc++ +
   # compiler-rt, libSystem still dynamic — a darwin host can't fully static-link),
-  # exactly the convention grep & every other engine package uses. Windows keeps
-  # its plain mingw cross set (off-engine; the PE folds the crt via -static below).
+  # exactly the convention grep & every other engine package uses. Windows takes
+  # the mingw cross set as handed in — the engine one under `multicall.windows`,
+  # plain mingw-gcc without it (the PE folds the crt via -static below either way).
   # `hp` also carries the build-host toolchain via `.buildPackages`.
   hp = if isWin then pkgs else pkgs.pkgsStatic;
   hostStdenv = hp.stdenv;
@@ -358,7 +359,7 @@ let
       chmod -R u+w zroot
 
       echo "=== Zig-style header dedup (src/dedup-headers.sh) ==="
-      bash ${./src}/dedup-headers.sh zroot common ${lib.concatMapStringsSep " " (e: e.t) linuxTargets}
+      bash ${./src/dedup-headers.sh} zroot common ${lib.concatMapStringsSep " " (e: e.t) linuxTargets}
       runHook postBuild
     '';
 
@@ -421,9 +422,12 @@ hostStdenv.mkDerivation {
 
     # VFS binding. The data flags are inlined at the compile below; only the
     # quote-free binding selector goes through a shell var.
-    #   ENGINE (linux/darwin): rename binding (unpinvfs_*) — the prefix() sed
-    #     rewrites each backend's open/stat/... IR symbols to unpinvfs_*, which
-    #     vfs.c defines under -DUNPIN_VFS_NOWRAP. Mega-safe, no --wrap.
+    #   ENGINE: rename binding (unpinvfs_*) — the prefix() sed rewrites each
+    #     backend's open/stat/... IR symbols to unpinvfs_*. Mega-safe, no --wrap.
+    #     vfs.c defines those shims under -DUNPIN_VFS_NOWRAP on linux/darwin; its
+    #     _WIN32 half has no NOWRAP mode, so there we select the explicit
+    #     unpin_vfs_* API (-DUNPIN_VFS_WIN_WRAPOPEN, strict /zip prefix match) and
+    #     src/vfs_win_bind.c names it unpinvfs_open. Still no --wrap.
     #   off-engine (mingw PE): `ld --wrap=open` on plain msvcrt open()
     #     (-DUNPIN_VFS_WIN_WRAPOPEN selects vfs.c's __wrap_open mode).
     if [ "$ENGINE" = 1 ]; then
@@ -435,7 +439,7 @@ hostStdenv.mkDerivation {
         [ -n "$__p" ] && { MT=$__p; break; }
       done
       [ -n "$MT" ] || { echo "tcc multi.nix: could not locate the engine llvm multitool" >&2; exit 1; }
-      VFSBIND="-DUNPIN_VFS_NOWRAP"
+      VFSBIND="${if isWin then "-DUNPIN_VFS_WIN_WRAPOPEN" else "-DUNPIN_VFS_NOWRAP"}"
       WRAPFLAGS=""
     else
       VFSBIND="-DUNPIN_VFS_WIN_WRAPOPEN"
@@ -527,16 +531,26 @@ hostStdenv.mkDerivation {
     $CC -O2 -I. $MZ -w -c miniz.c -o miniz.o
     $CC -O2 -I. -DMINIZ_USE_ZSTD -DUNPIN_ZSTD_VENDORED -w -c unpin_zstd.c -o unpin_zstd.o
     $CC -O2 -I. -DUNPIN_VFS_SELF -DUNPIN_VFS_ROOT='"/zip/"' -DMINIZ_USE_ZSTD $VFSBIND -c vfs.c -o vfs.o
-    $CC -O2 -c ${./src}/dispatch.c -o dispatch.o
+    $CC -O2 -c ${./src/dispatch.c} -o dispatch.o
+    ${lib.optionalString isWin ''
+      # On the engine the windows binding needs one adapter object (see the
+      # VFSBIND comment above); off it, --wrap does the whole job.
+      BINDOBJ=
+      if [ "$ENGINE" = 1 ]; then
+        $CC -O2 -c ${./src/vfs_win_bind.c} -o vfs_win_bind.o
+        BINDOBJ=vfs_win_bind.o
+      fi
+    ''}
 
     echo "=== link ONE binary (host=${hostPlat.system}; no blob — sysroot rides the EOF) ==="
     # On darwin everything is bitcode, so the engine's ELF ld.lld LTO-compiles it
     # straight to Mach-O; on linux it is a static-musl LTO link; on the mingw PE
-    # -static folds the crt and --wrap=open routes reads through the VFS.
+    # -static folds the crt, and the VFS is reached by rename or by --wrap=open
+    # depending on the engine (BINDOBJ / WRAPFLAGS above).
     $CC ${if isDarwin then "" else "-static"} -o ${binName} dispatch.o \
       ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") linuxTargets} ${winG}-pfx.o \
       ${lib.concatMapStringsSep " " (e: "${e.g}-pfx.o") osxTargets} \
-      vfs.o miniz.o unpin_zstd.o \
+      vfs.o miniz.o unpin_zstd.o ${lib.optionalString isWin "$BINDOBJ "}\
       $WRAPFLAGS ${if isDarwin || isWin then "-lm" else "-lm -ldl -lpthread"}
     runHook postBuild
   '';

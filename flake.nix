@@ -23,7 +23,7 @@
   outputs = { self, unpins-lib }:
     let
       ulib = unpins-lib.lib;
-      multi = import ./multi.nix { inherit (ulib) vfsCore; };
+      multi = import ./multi.nix { inherit (ulib) vfsCore vfsBindFns; };
       # The per-target sysroot /zip tree — host-independent, exposed by ./multi.nix
       # as passthru.sysrootTree (built once, shared by every host + the mega).
       sysrootTreeFor = pkgs: (multi pkgs).sysrootTree;

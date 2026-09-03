@@ -26,7 +26,7 @@
 # FORMAT (ELF / PE / Mach-O) for the VFS binding (rename on the bitcode engine,
 # `--wrap=open` on the off-engine mingw PE) and the link tail; the eight TARGETS
 # and the embedded sysroot tree are identical everywhere.
-{ vfsCore }:
+{ vfsCore, vfsBindFns }:
 pkgs:
 let
   lib = pkgs.lib;
@@ -443,6 +443,8 @@ hostStdenv.mkDerivation {
     fi
     echo "ENGINE=$ENGINE MT=''${MT:-} VFSBIND=$VFSBIND"
 
+    ${vfsBindFns { }}
+
     echo "=== build with the build-host cc first (c2str + tccdefs_.h; run here) ==="
     # c2str and tccdefs_.h are build-host tools/artifacts: build them with the
     # vanilla build cc so they RUN here (a $CC-built c2str is host-arch and can't
@@ -469,35 +471,29 @@ hostStdenv.mkDerivation {
     # access must reach the VFS.
     #
     # ENGINE (bitcode): rewrite IR symbols (opt -S -> sed on the .ll -> opt). The
-    #   dispatcher calls eight distinct mains, so main -> <g>_main; the VFS binds
-    #   by rename (mega-safe, no --wrap), so open/stat/lstat/access -> unpinvfs_*
-    #   (incl. 32-bit musl's __stat_time64/__lstat_time64). Then opt -internalize
-    #   localizes everything but <g>_main. `@sym` is a FUNCTION symbol (sigil
-    #   differs from `%struct.sym`), so renaming @stat never touches `struct stat`.
-    #   The Mach-O `_` is added only at object emission. darwin's SDK headers give
-    #   the libc imports raw-symbol asm labels (`@"\01_open"`, the 64-bit-inode
-    #   `@"\01_stat$INODE64"`), so the VFS rename needs a second rule set for those;
-    #   each rule that can't match a target's IR is a harmless no-op there.
+    #   dispatcher calls eight distinct mains, so main -> <g>_main (tcc's own
+    #   rename, done here); the VFS binds by rename (mega-safe, no --wrap) via
+    #   nix-lib's shared vfsSed, which knows every spelling a libc file op can
+    #   carry -- the plain form, 32-bit musl's __*_time64 aliases, and darwin's
+    #   raw asm labels including the x86_64 $INODE64 variants. Then opt
+    #   -internalize localizes everything but <g>_main. `@sym` is a FUNCTION
+    #   symbol (sigil differs from `%struct.sym`), so renaming @stat never
+    #   touches `struct stat`. The Mach-O `_` is added only at object emission.
     # OFF-ENGINE (PE on the mingw Windows cross): nm + objcopy --redefine-syms
     #   prefixes every defined global. ELF/PE have no leading underscore.
     prefix() {  # $1 = target stem   $2 = C symbol tag (g)
       if [ "$ENGINE" = 1 ]; then
         $MT opt -S $1-tcc.o -o $1.ll
-        sed -i \
-          -e 's/@main\b/@'"$2"'_main/g' \
-          -e 's/@open\b/@unpinvfs_open/g' \
-          -e 's/@stat\b/@unpinvfs_stat/g' \
-          -e 's/@lstat\b/@unpinvfs_lstat/g' \
-          -e 's/@access\b/@unpinvfs_access/g' \
-          -e 's/@__stat_time64\b/@unpinvfs_stat/g' \
-          -e 's/@__lstat_time64\b/@unpinvfs_lstat/g' \
-          -e 's/@"\\01__stat_time64"/@unpinvfs_stat/g' \
-          -e 's/@"\\01__lstat_time64"/@unpinvfs_lstat/g' \
-          -e 's/@"\\01_open"/@unpinvfs_open/g' \
-          -e 's/@"\\01_access"/@unpinvfs_access/g' \
-          -e 's/@"\\01_stat\$INODE64"/@unpinvfs_stat/g' \
-          -e 's/@"\\01_lstat\$INODE64"/@unpinvfs_lstat/g' \
-          $1.ll
+        # tcc's OWN rename: the dispatcher calls eight distinct mains.
+        sed -i -e 's/@main\b/@'"$2"'_main/g' $1.ll
+        # The VFS rename comes from nix-lib (lib.vfsBindFns) — ONE home for the
+        # spelling logic, instead of the private copy that used to live here and
+        # had drifted two rules behind it (the plain `\01_stat`/`\01_lstat`, the
+        # arm64-darwin spelling). Same default symbol set as before; in practice
+        # only open() ever matches, since tcc reads every include through
+        # tcc_open() -> open() and its one fopen() is the `-E` OUTPUT file, which
+        # must reach the real filesystem.
+        vfsSed $1.ll
         $MT opt -passes=internalize -internalize-public-api-list="$2"_main $1.ll -o $2-pfx.o
       else
         ${nmBin} -g --defined-only $1-tcc.o | awk -v p=$2 ${

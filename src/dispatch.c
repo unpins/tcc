@@ -15,7 +15,7 @@
  * Target on the command line. Names follow the project's arch-os convention —
  * the exact spellings of the nix systems and release assets, and the ONLY ones
  * accepted (no abbreviations or alternative spellings):
- *   default (no flag) ............ native x86_64 ELF
+ *   default (no flag) ............ the backend matching this machine
  *   -target=x86_64-linux ......... x86_64 ELF
  *   -target=i686-linux ........... i686 ELF (runs here under IA32 emulation)
  *   -target=armv7l-linux ......... armv7l (eabihf) ELF
@@ -42,6 +42,34 @@ extern int arm64_osx_main(int, char **);
 
 typedef int (*entry_t)(int, char **);
 
+/* A bare `tcc` must compile for the machine it runs on -- and that backend is
+ * also the only one whose -run works (tcc.h defines TCC_IS_NATIVE for exactly
+ * the backend matching the host it was compiled for). Picked from the host
+ * compiler's own macros, since the dispatcher is compiled for the host.
+ * ppc64le ships a binary but tcc has no ppc64 codegen, so there the default
+ * falls back to x86_64 ELF -- the target must be named there. */
+#if defined _WIN32
+# define HOST_MAIN win32_main
+#elif defined __APPLE__
+# if defined __aarch64__
+#  define HOST_MAIN arm64_osx_main
+# else
+#  define HOST_MAIN x86_64_osx_main
+# endif
+#elif defined __x86_64__
+# define HOST_MAIN x86_64_main
+#elif defined __i386__
+# define HOST_MAIN i386_main
+#elif defined __aarch64__
+# define HOST_MAIN arm64_main
+#elif defined __arm__
+# define HOST_MAIN arm_main
+#elif defined __riscv && __riscv_xlen == 64
+# define HOST_MAIN riscv64_main
+#else
+# define HOST_MAIN x86_64_main
+#endif
+
 struct backend { const char *name; entry_t fn; };
 
 static const struct backend backends[] = {
@@ -64,7 +92,7 @@ static entry_t resolve(const char *name)
 
 int main(int argc, char **argv)
 {
-    entry_t entry = x86_64_main; /* native default */
+    entry_t entry = HOST_MAIN;
 
     char **out = calloc((size_t)argc + 1, sizeof *out);
     if (!out) return 1;

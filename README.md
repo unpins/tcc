@@ -15,6 +15,7 @@ Run `tcc` with [unpin](https://github.com/unpins/unpin) — bare, it compiles fo
 
 ```bash
 unpin tcc hello.c -o hello
+unpin tcc -run hello.c          # compile in memory and run it straight away
 ```
 
 Pick a different target with `-target=` and the same binary cross-compiles — no toolchain to install, no sysroot on disk:
@@ -98,7 +99,7 @@ The [Releases](https://github.com/unpins/tcc/releases) page has standalone binar
   hoisted into one tier searched after each per-arch tier — Zig's trick for
   `zig cc` — so the embedded headers don't grow with the target count.
 - **Tests.** upstream tcc's `make test` targets a conventional single-target
-  build, not this eight-backend fold, so it isn't wired. Verification is instead
-  end-to-end: the release build compiles and runs a program for the native
-  target (and cross-compiles a Windows PE / macOS Mach-O), exercising the folded
-  backends and the embedded sysroots.
+  build, not this eight-backend fold, so it isn't wired. CI's release smoke runs
+  `--version` only; compiling and running a program for each host, and
+  cross-compiling to the other seven targets, is checked by hand before a
+  release.

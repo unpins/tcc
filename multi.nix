@@ -318,6 +318,16 @@ let
         "C_INCLUDE_PATH=${sdkRoot}/usr/include make ${e.t}-libtcc1.a $J ${pvLine e.t}"
       ) osxTargets}
 
+      echo "=== build each target's runmain.o (the -run support object) ==="
+      # lib/Makefile emits runmain.o only for a NATIVE compiler ($(Nat)); every
+      # target here is a cross from the build's point of view, so `-run` shipped
+      # without its support object and died with "library '<t>-runmain.o' not
+      # found" on the one target that does run natively. runmain.c includes no
+      # headers, so each cross-tcc compiles it as is.
+      for t in ${lib.concatStringsSep " " allTargets}; do
+        ./$t-tcc -c lib/runmain.c -o $t-runmain.o
+      done
+
       echo "=== assemble the /zip tree with per-target sysroot subtrees ==="
       rm -rf zroot
       mkLinux() {  # $1=target  $2=sysroot (clang-built musl: include/ + lib/)
@@ -327,7 +337,7 @@ let
         cp -aL $2/include/. zroot/$1/include/ && chmod -R u+w zroot/$1/include
         cp -af include/. zroot/$1/include/ && chmod -R u+w zroot/$1/include
         cp -a $2/lib/crt1.o $2/lib/crti.o $2/lib/crtn.o $2/lib/libc.a zroot/$1/lib/
-        cp -a $1-libtcc1.a zroot/$1/lib/tcc/
+        cp -a $1-libtcc1.a $1-runmain.o zroot/$1/lib/tcc/
       }
       ${lib.concatMapStringsSep "\n    " (e: "mkLinux ${e.t} ${e.sysroot}") linuxTargets}
 
@@ -336,7 +346,7 @@ let
       cp -a win32/include/. zroot/${winT}/include/
       cp -a include/*.h     zroot/${winT}/include/
       cp -a win32/lib/*.def zroot/${winT}/lib/
-      cp -a ${winT}-libtcc1.a zroot/${winT}/lib/tcc/
+      cp -a ${winT}-libtcc1.a ${winT}-runmain.o zroot/${winT}/lib/tcc/
 
       # osx subtree (shared by both arches at /zip/osx): SDK C headers + tcc
       # intrinsics, and libSystem.tbd under every name tcc may resolve. The VFS
@@ -354,7 +364,7 @@ let
         cp -a "$real" zroot/osx/lib/$n.tbd
       done
       ${lib.concatMapStringsSep "\n    " (e:
-        "mkdir -p zroot/${e.t}/lib/tcc && cp -a ${e.t}-libtcc1.a zroot/${e.t}/lib/tcc/"
+        "mkdir -p zroot/${e.t}/lib/tcc && cp -a ${e.t}-libtcc1.a ${e.t}-runmain.o zroot/${e.t}/lib/tcc/"
       ) osxTargets}
       chmod -R u+w zroot
 

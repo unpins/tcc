@@ -98,7 +98,11 @@ let
         triple = cp.stdenv.hostPlatform.config;
     in linuxPkgs.stdenv.mkDerivation {
       pname = "tcc-musl-sysroot-${triple}";
-      inherit (cp.musl) version src;
+      # `patches` too, not just `src`: nixpkgs keeps musl on a pinned 1.2.5 and
+      # closes its CVEs by backport (iconv OOB write CVE-2025-26519 ×2,
+      # CVE-2026-6042, CVE-2026-40200), so taking the tarball alone builds a libc
+      # the version string says is current.
+      inherit (cp.musl) version src patches;
       nativeBuildInputs = [ linuxPkgs.llvmPackages.clang-unwrapped linuxPkgs.llvm ];
       dontConfigure = true;
       # tcc's archive reader only understands a GNU `ar` (the symbol index is the

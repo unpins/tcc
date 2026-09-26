@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.9.27-unstable-2025-01-06-2] - 2026-09-26
+
 ### Changed
 
 - The Windows binary is now built by the same compiler as the Linux and macOS

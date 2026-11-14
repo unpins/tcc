@@ -341,6 +341,11 @@ let
         cp -aL $2/include/. zroot/$1/include/ && chmod -R u+w zroot/$1/include
         cp -af include/. zroot/$1/include/ && chmod -R u+w zroot/$1/include
         cp -a $2/lib/crt1.o $2/lib/crti.o $2/lib/crtn.o $2/lib/libc.a zroot/$1/lib/
+        # musl keeps all of libm/libpthread/… in libc.a and installs these as
+        # empty archives, only so `-lm`, `-pthread` and friends resolve.
+        for l in m pthread dl rt crypt util xnet resolv; do
+          cp -a $2/lib/lib$l.a zroot/$1/lib/
+        done
         cp -a $1-libtcc1.a $1-runmain.o zroot/$1/lib/tcc/
       }
       ${lib.concatMapStringsSep "\n    " (e: "mkLinux ${e.t} ${e.sysroot}") linuxTargets}

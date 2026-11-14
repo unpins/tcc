@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Compiling for Linux, `-lm`, `-lpthread`, `-ldl`, `-lrt` and `-pthread` now
+  work; they failed with `library 'm' not found`. musl keeps all of these in
+  `libc.a`, but the build systems that pass them expect the libraries to exist.
+
 ## [0.9.27-unstable-2025-01-06-2] - 2026-09-26
 
 ### Changed

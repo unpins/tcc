@@ -1,0 +1,46 @@
+Make the __aeabi_mem* fallbacks weak.
+
+armeabi.c provides them "for targets that do not have all eabi calls",
+but musl's ARM port defines them too, and the two strong definitions
+collide as soon as armeabi.o is pulled in (for __aeabi_idivmod). Weak,
+musl's win when present and these still cover a libc without them.
+
+--- a/lib/armeabi.c
++++ b/lib/armeabi.c
+@@ -514,31 +514,31 @@
+ extern void *memset(void *s, int c, size_t n);
+ 
+ void *
+-__aeabi_memcpy (void *dest, const void *src, size_t n)
++__attribute__((weak)) __aeabi_memcpy (void *dest, const void *src, size_t n)
+ {
+     return memcpy (dest, src, n);
+ }
+ 
+ void *
+-__aeabi_memmove (void *dest, const void *src, size_t n)
++__attribute__((weak)) __aeabi_memmove (void *dest, const void *src, size_t n)
+ {
+     return memmove (dest, src, n);
+ }
+ 
+ void *
+-__aeabi_memmove4 (void *dest, const void *src, size_t n)
++__attribute__((weak)) __aeabi_memmove4 (void *dest, const void *src, size_t n)
+ {
+     return memmove (dest, src, n);
+ }
+ 
+ void *
+-__aeabi_memmove8 (void *dest, const void *src, size_t n)
++__attribute__((weak)) __aeabi_memmove8 (void *dest, const void *src, size_t n)
+ {
+     return memmove (dest, src, n);
+ }
+ 
+ void *
+-__aeabi_memset (void *s, size_t n, int c)
++__attribute__((weak)) __aeabi_memset (void *s, size_t n, int c)
+ {
+     return memset (s, c, n);
+ }

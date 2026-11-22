@@ -1,0 +1,18 @@
+Link executables statically by default.
+
+Not for PE or Mach-O, which have no static libc: a PE links msvcrt.dll
+and a Mach-O links libSystem.
+
+--- a/libtcc.c
++++ b/libtcc.c
+@@ -847,6 +847,10 @@
+     /* might be used in error() before preprocess_start() */
+     s->include_stack_ptr = s->include_stack;
+ 
++    
++#if !defined TCC_TARGET_PE && !defined TCC_TARGET_MACHO
++    s->static_link = 1;
++#endif
+     tcc_set_lib_path(s, CONFIG_TCCDIR);
+     return s;
+ }

@@ -4,9 +4,9 @@
  * single *-gen.c), so each target is a complete compile of tcc. With ONE_SOURCE
  * the whole compiler is one object whose only GLOBAL symbols are the ~34 libtcc
  * public-API functions plus main() (everything else is file-static), so the
- * eight objects are made collision-free by prefixing those globals per target
- * with `objcopy --redefine-syms` (main -> x86_64_main / i386_main / arm_main /
- * arm64_main / riscv64_main / win32_main / x86_64_osx_main / arm64_osx_main).
+ * eight objects are made collision-free by renaming those globals per target
+ * in the IR (main -> x86_64_main / i386_main / arm_main / arm64_main /
+ * riscv64_main / win32_main / x86_64_osx_main / arm64_osx_main).
  * All are linked into this one binary; the dispatcher just CALLS the right entry
  * in-process -- no child process, no fexecve, one libc, one VFS. Each target's
  * sysroot lives in its own /zip/<target>/ subtree, served by the shared

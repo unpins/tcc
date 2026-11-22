@@ -7,6 +7,11 @@
 - Compiling for Linux, `-lm`, `-lpthread`, `-ldl`, `-lrt` and `-pthread` now
   work; they failed with `library 'm' not found`. musl keeps all of these in
   `libc.a`, but the build systems that pass them expect the libraries to exist.
+- `<sys/queue.h>`, `<sys/cdefs.h>` and `<sys/tree.h>` are available for Linux
+  targets, as with musl on a distribution.
+- `-bt` and `-ftest-coverage` work, for every target, and `-b` for Windows and
+  macOS output. They failed with `library '<target>-bt-exe.o' not found` (or
+  an undefined `__store_test_coverage`).
 
 ## [0.9.27-unstable-2025-01-06-2] - 2026-09-26
 

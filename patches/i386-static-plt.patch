@@ -1,0 +1,16 @@
+i386: relocate the PLT of a static executable.
+
+i386 has no PC32 collapse, so a static executable still goes through
+its PLT, which must be relocated.
+
+--- a/tccelf.c
++++ b/tccelf.c
+@@ -2958,7 +2958,7 @@
+ 
+         /* if building executable or DLL, then relocate each section
+            except the GOT which is already relocated */
+-        relocate_syms(s1, s1->symtab, 0);
++        if (!dynamic && s1->plt && file_type == TCC_OUTPUT_EXE) relocate_plt(s1); relocate_syms(s1, s1->symtab, 0);
+         if (s1->nb_errors != 0)
+             goto the_end;
+         relocate_sections(s1);

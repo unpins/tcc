@@ -1,0 +1,23 @@
+Write a long double 0.0 constant without the host's bytes.
+
+tcc emits a long double constant by copying the host long double, which
+only works when the host type is at least as wide as the target's. On an
+aarch64 macOS build host long double is 64-bit, so building libtcc1 for
+any target with a wider one died with "can't cross compile long double
+constants". The only such constant in libtcc1.c and lib-arm64.c is the
+implicit 0.0L of comparisons, and 0.0L is all-zero bytes everywhere.
+Write LDOUBLE_SIZE zero bytes for it; any other constant still errors.
+
+--- a/tccgen.c
++++ b/tccgen.c
+@@ -7776,8 +7776,8 @@
+                     memcpy(ptr, &vtop->c.ld, LDOUBLE_SIZE);
+                 else if (sizeof(double) == LDOUBLE_SIZE)
+                     *(double*)ptr = (double)vtop->c.ld;
+-                else if (0 == memcmp(ptr, &vtop->c.ld, LDOUBLE_SIZE))
+-                    ; /* nothing to do for 0.0 */
++                else if (vtop->c.ld == 0.0)
++                    memset(ptr, 0, LDOUBLE_SIZE); /* 0.0L is all-zero on every target; host long double may be narrower */
+ #ifndef TCC_CROSS_TEST
+                 else
+                     tcc_error("can't cross compile long double constants");

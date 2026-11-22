@@ -1,0 +1,18 @@
+Search libc again after libtcc1.
+
+A static ELF link has a circular dependency between libc and libtcc1
+(printf needs __udivdi3, which needs libc). Not for Mach-O, which is
+dynamic: a second libc would only repeat the libSystem load command.
+
+--- a/tccelf.c
++++ b/tccelf.c
+@@ -1803,6 +1803,9 @@
+         if (TCC_LIBTCC1[0])
+             tcc_add_support(s1, TCC_LIBTCC1);
+ #ifndef TCC_TARGET_MACHO
++    tcc_add_library(s1, "c");
++#endif
++#ifndef TCC_TARGET_MACHO
+         if (s1->output_type != TCC_OUTPUT_MEMORY)
+             tccelf_add_crtend(s1);
+ #endif

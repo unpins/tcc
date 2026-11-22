@@ -1,0 +1,59 @@
+riscv64: pair PCREL_LO12 with the right PCREL_HI20.
+
+tcc pairs PCREL_HI20/LO12 through a single last_hi slot, assuming the
+relocs alternate HI,LO,HI,LO as gcc emits them. clang hoists and shares
+its auipc instructions (several HI20 before their LO12, one HI20 for
+several LO12), so last_hi is the wrong HI by the time a LO12 arrives:
+"unsupported hi/lo pcrel reloc scheme". Record every HI20 and, on each
+LO12, look up the HI at the LO12's target address. gcc's paired relocs
+still resolve the same way.
+
+--- a/riscv64-link.c
++++ b/riscv64-link.c
+@@ -169,6 +169,10 @@
+     }
+ }
+ 
++
++static struct pcrel_hi *rv_his; static int rv_his_n;
++static void rv_rec_hi(addr_t a, addr_t v){ rv_his = tcc_realloc(rv_his, (rv_his_n+1)*sizeof(*rv_his)); rv_his[rv_his_n].addr = a; rv_his[rv_his_n].val = v; rv_his_n++; }
++static int rv_find_hi(addr_t a){ int i; for (i = rv_his_n; --i >= 0; ) if (rv_his[i].addr == a) return i; return -1; }
+ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+               addr_t addr, addr_t val)
+ {
+@@ -225,7 +229,7 @@
+         write32le(ptr, (read32le(ptr) & 0xfff)
+                        | ((off64 & 0xfffff) << 12));
+         last_hi.addr = addr;
+-        last_hi.val = val;
++        last_hi.val = val; rv_rec_hi(addr, val);
+         return;
+     case R_RISCV_GOT_HI20:
+         val = s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset;
+@@ -233,7 +237,7 @@
+         if ((off64 + ((uint64_t)1 << 20)) >> 21)
+           tcc_error_noabort("R_RISCV_GOT_HI20 relocation failed");
+         last_hi.addr = addr;
+-        last_hi.val = val;
++        last_hi.val = val; rv_rec_hi(addr, val);
+         write32le(ptr, (read32le(ptr) & 0xfff)
+                        | ((off64 & 0xfffff) << 12));
+         return;
+@@ -241,7 +245,7 @@
+ #ifdef DEBUG_RELOC
+         printf("PCREL_LO12_I: val=%lx addr=%lx\n", (long)val, (long)addr);
+ #endif
+-        if (val != last_hi.addr)
++        { int rvi = rv_find_hi(val); if (rvi >= 0) last_hi = rv_his[rvi]; } if (val != last_hi.addr)
+           tcc_error_noabort("unsupported hi/lo pcrel reloc scheme");
+         val = last_hi.val;
+         addr = last_hi.addr;
+@@ -249,7 +253,7 @@
+                        | (((val - addr) & 0xfff) << 20));
+         return;
+     case R_RISCV_PCREL_LO12_S:
+-        if (val != last_hi.addr)
++        { int rvi = rv_find_hi(val); if (rvi >= 0) last_hi = rv_his[rvi]; } if (val != last_hi.addr)
+           tcc_error_noabort("unsupported hi/lo pcrel reloc scheme");
+         val = last_hi.val;
+         addr = last_hi.addr;

@@ -14,8 +14,8 @@
   # eight ONE_SOURCE tcc backends + a dispatcher into one executable; each
   # target's sysroot is served by the shared unpin-vfs core as a /zip VFS. The
   # sysroot tree rides the binary's EOF ZIP (the same self-EOF scheme file uses
-  # for magic.mgc — runtimeDataRoot/runtimeEmbed → withRuntimeData), NOT compiled
-  # in via `.incbin`, so the binary folds into the unpinbox mega cleanly. Linux
+  # for magic.mgc — runtimeEmbed → unpinEmbedWrap), NOT compiled in via
+  # `.incbin`, so the binary stays foldable into a catalog mega. Linux
   # output defaults to static (portable). mkStandaloneFlake hands ./multi.nix the
   # host pkgs set per catalog system; it branches on the host's ELF/PE/Mach-O
   # format. tcc has no PowerPC codegen, so a ppc64le *host* emits the eight
@@ -45,12 +45,12 @@
         # then binds by rename there as well — see multi.nix's VFSBIND.
         windows = true;
         programs = [{ name = "tcc"; }];
-        # Merge tcc's /zip sysroot tree into the mega's EOF ZIP (like file's
-        # magic.mgc). No `.incbin`/blob, so nothing is left unresolved in the
-        # bitcode module for the mega-link to satisfy.
+        # For a mega that folds tcc: merge its /zip sysroot tree into the mega's
+        # EOF ZIP (like file's magic.mgc). No `.incbin`/blob, so nothing is left
+        # unresolved in the bitcode module for a mega link to satisfy.
         runtimeDataRoot = pkgs: sysrootTreeFor pkgs;
       };
-      # nixpkgs ships TinyCC as `tinycc`; used for the man page + license.
+      # nixpkgs ships TinyCC as `tinycc`; used only for the Windows man graft.
       pkgsAttr = "tinycc";
       license = "LGPL-2.1-only";
       smoke = [ "--version" ];

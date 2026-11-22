@@ -5,17 +5,17 @@
 # tcc is one-backend-per-binary (libtcc.c #includes a single *-gen.c), so each
 # target is a full ONE_SOURCE compile of tcc (`<t>-tcc.o` = the whole compiler
 # in one object). Its only GLOBAL symbols are the ~34 libtcc public-API functions
-# plus main(); everything else is file-static. We prefix those globals per target
-# with `objcopy --redefine-syms` (main -> x86_64_main / win32_main / …), link all
-# eight prefixed objects + src/dispatch.c into one executable, and the dispatcher
+# plus main(); everything else is file-static. We rename those globals per
+# target in the IR (main -> x86_64_main / win32_main / …), link all eight
+# renamed objects + src/dispatch.c into one executable, and the dispatcher
 # CALLS the selected backend in-process — no fexecve, one libc, one VFS. Each
 # target's sysroot (libc headers + crt + libc.a) lives in its own /zip/<target>/
-# subtree, served by the shared unpin-vfs core (src/vfs.c) in SELF-EOF mode: the
-# sysroot ZIP is appended to the binary's EOF by the nix build (the same scheme
-# `file` uses for magic.mgc — runtimeDataRoot/runtimeEmbed → withRuntimeData),
-# NOT compiled in via `.incbin`. That keeps the data out of the bitcode module so
-# the binary folds into the unpinbox mega cleanly (a `.incbin` would leave an
-# unresolved blob in module.bc that the mega-link can't satisfy). The sysroot
+# subtree, served by the shared unpin-vfs core (nix-lib's vfsCore) in SELF-EOF
+# mode: the sysroot ZIP is appended to the binary's EOF by the nix build (the
+# same scheme `file` uses for magic.mgc — runtimeEmbed → unpinEmbedWrap), NOT
+# compiled in via `.incbin`. That keeps the data out of the bitcode module, so
+# the binary stays foldable into a catalog mega (a `.incbin` would leave an
+# unresolved blob in module.bc that a mega link can't satisfy). The sysroot
 # tree itself is host-independent, so it is built ONCE here (`sysrootTree`) and
 # embedded by every host arch + the mega alike.
 #
@@ -93,6 +93,26 @@ let
   # linuxHeaders — pure data, no compiler. The derivation runs on the build host
   # and emits target machine code, so every host (Linux, the Windows cross's Linux
   # build host, and macOS) produces real libc.a from source with no per-target gcc.
+  # musl ships no BSD compat headers; nixpkgs' musl installs Alpine's three in
+  # postInstall, which this from-source build skips. Same Alpine pin as nixpkgs
+  # (and nix-lib's toolchain); re-check when pkgs/by-name/mu/musl moves.
+  bsdHeaders = {
+    cdefs = linuxPkgs.fetchurl {
+      name = "sys-cdefs.h";
+      url = "https://git.alpinelinux.org/aports/plain/main/libc-dev/sys-cdefs.h?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+      sha256 = "16l3dqnfq0f20rzbkhc38v74nqcsh9n3f343bpczqq8b1rz6vfrh";
+    };
+    queue = linuxPkgs.fetchurl {
+      name = "sys-queue.h";
+      url = "http://git.alpinelinux.org/aports/plain/main/libc-dev/sys-queue.h?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+      sha256 = "12qm82id7zys92a1qh2l1qf2wqgq6jr4qlbjmqyfffz3s3nhfd61";
+    };
+    tree = linuxPkgs.fetchurl {
+      name = "sys-tree.h";
+      url = "http://git.alpinelinux.org/aports/plain/main/libc-dev/sys-tree.h?id=7ca0ed62d4c0d713d9c7dd5b9a077fba78bce578";
+      sha256 = "14igk6k00bnpfw660qhswagyhvr0gfqg4q55dxvaaq7ikfkrir71";
+    };
+  };
   mkSysroot = { cross }:
     let cp = linuxPkgs.pkgsCross.${cross};
         triple = cp.stdenv.hostPlatform.config;
@@ -130,6 +150,9 @@ let
         make install DESTDIR=$out prefix=/
         cp -aL ${cp.linuxHeaders}/include/. $out/include/   # kernel UAPI (per-arch)
         chmod -R u+w $out/include
+        install -m644 ${bsdHeaders.cdefs} $out/include/sys/cdefs.h
+        install -m644 ${bsdHeaders.queue} $out/include/sys/queue.h
+        install -m644 ${bsdHeaders.tree}  $out/include/sys/tree.h
         runHook postInstall
       '';
       # Guard the invariant tcc depends on: libc.a MUST stay a GNU archive (its
@@ -145,7 +168,7 @@ let
   # (objcopy prefix + dispatch.c extern); `sysroot` = the clang-built musl tree
   # (`/include` + `/lib`) supplying that ELF target's headers + crt*.o + libc.a.
   # All five — riscv64 included — link clean once tcc's RISC-V reloc handler is
-  # taught clang's hoisted hi/lo scheme (the riscv64-link.c patch in commonPatch).
+  # taught clang's hoisted hi/lo scheme (patches/riscv64-pcrel-hi-table.patch).
   linuxTargets = map (e: e // { sysroot = mkSysroot { inherit (e) cross; }; }) [
     { t = "x86_64";  g = "x86_64";  cross = "musl64"; }
     { t = "i386";    g = "i386";    cross = "musl32"; }
@@ -200,84 +223,17 @@ let
     "CRT-${t}='${crt}' LIB-${t}='${libl}' INC-${t}='${incPath t}'"; # single-quote so a ';' sep isn't a shell terminator
   allPv = lib.concatMapStringsSep " " pvLine allTargets;
 
-  # Source patches. Single-line --replace-fail anchors only (a multi-line search
-  # pattern gets re-indented inside a Nix ''-string and fails to match; multi-line
-  # replacements are fine — C is whitespace-insensitive). Each anchor occurs once.
-  # Shared by sysrootTree (libtcc1.a generation) and the host binary build.
-  commonPatch = ''
-    # i386: tcc emits a named local reloc for __udivmoddi4 — promote it to global.
-    substituteInPlace lib/libtcc1.c \
-      --replace-fail 'static UDWtype __udivmoddi4 ' 'UDWtype __udivmoddi4 '
-
-    # arm: armeabi.c's __aeabi_mem* are fallbacks "for targets that do not have
-    # all eabi calls" (its own comment), but musl's ARM port DEFINES them (strong).
-    # Two strong defs collide the moment armeabi.o is pulled (for __aeabi_idivmod).
-    # Make the fallbacks weak so musl's win when present and they still cover a
-    # libc that lacks them. armeabi.c is compiled only for the arm backend.
-    substituteInPlace lib/armeabi.c \
-      --replace-fail '__aeabi_memcpy (void *dest, const void *src, size_t n)'   '__attribute__((weak)) __aeabi_memcpy (void *dest, const void *src, size_t n)' \
-      --replace-fail '__aeabi_memmove (void *dest, const void *src, size_t n)'  '__attribute__((weak)) __aeabi_memmove (void *dest, const void *src, size_t n)' \
-      --replace-fail '__aeabi_memmove4 (void *dest, const void *src, size_t n)' '__attribute__((weak)) __aeabi_memmove4 (void *dest, const void *src, size_t n)' \
-      --replace-fail '__aeabi_memmove8 (void *dest, const void *src, size_t n)' '__attribute__((weak)) __aeabi_memmove8 (void *dest, const void *src, size_t n)' \
-      --replace-fail '__aeabi_memset (void *s, size_t n, int c)'                '__attribute__((weak)) __aeabi_memset (void *s, size_t n, int c)'
-
-    # Default to portable static executables — but NOT for PE/Mach-O, which have
-    # no static libc (a PE links msvcrt.dll, a Mach-O links libSystem).
-    substituteInPlace libtcc.c \
-      --replace-fail 'tcc_set_lib_path(s, CONFIG_TCCDIR);' '
-    #if !defined TCC_TARGET_PE && !defined TCC_TARGET_MACHO
-        s->static_link = 1;
-    #endif
-        tcc_set_lib_path(s, CONFIG_TCCDIR);'
-
-    # Re-scan libc after libtcc1 (ELF static circular dep: printf <-> __udivdi3).
-    # Skipped for Mach-O — it is dynamic, so a second libc would only duplicate
-    # the libSystem load command.
-    substituteInPlace tccelf.c \
-      --replace-fail 'tcc_add_support(s1, TCC_LIBTCC1);' 'tcc_add_support(s1, TCC_LIBTCC1);
-    #ifndef TCC_TARGET_MACHO
-        tcc_add_library(s1, "c");
-    #endif'
-
-    # i386: relocate the PLT for static EXEs (no PC32 collapse on i386).
-    substituteInPlace tccelf.c \
-      --replace-fail 'relocate_syms(s1, s1->symtab, 0);' 'if (!dynamic && s1->plt && file_type == TCC_OUTPUT_EXE) relocate_plt(s1); relocate_syms(s1, s1->symtab, 0);'
-
-    # riscv64: tcc pairs PCREL_HI20/LO12 through a single `last_hi` slot, assuming
-    # the relocs alternate HI,LO,HI,LO (as gcc emits). clang hoists/coalesces the
-    # `auipc`s — several HI20 before their LO12, one HI20 shared by several LO12 —
-    # so `last_hi` is the wrong HI by the time a LO12 arrives ("unsupported hi/lo
-    # pcrel reloc scheme"). Record every HI20 in a table and, on each LO12, refresh
-    # last_hi from the HI at address `val` (the LO12's target). A strict superset of
-    # the old behaviour: gcc's paired relocs still resolve. Needed so the riscv64
-    # backend links clang-built musl — keeping every target on the single clang.
-    substituteInPlace riscv64-link.c \
-      --replace-fail 'ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,' '
-    static struct pcrel_hi *rv_his; static int rv_his_n;
-    static void rv_rec_hi(addr_t a, addr_t v){ rv_his = tcc_realloc(rv_his, (rv_his_n+1)*sizeof(*rv_his)); rv_his[rv_his_n].addr = a; rv_his[rv_his_n].val = v; rv_his_n++; }
-    static int rv_find_hi(addr_t a){ int i; for (i = rv_his_n; --i >= 0; ) if (rv_his[i].addr == a) return i; return -1; }
-    ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,' \
-      --replace-fail 'last_hi.val = val;' 'last_hi.val = val; rv_rec_hi(addr, val);' \
-      --replace-fail 'if (val != last_hi.addr)' '{ int rvi = rv_find_hi(val); if (rvi >= 0) last_hi = rv_his[rvi]; } if (val != last_hi.addr)'
-
-    # libtcc1 is built by RUNNING each cross-tcc on the build host. tcc emits a
-    # long double CONSTANT by copying the host long double's bytes, which only
-    # works when the host long double is at least as wide as the target's
-    # (LDOUBLE_SIZE). On an aarch64-macOS build host long double is 64-bit, so for
-    # every target whose LDOUBLE_SIZE > 8 (x86_64/i386/arm64/riscv64 and x86_64-osx)
-    # tcc aborts libtcc1.c with "can't cross compile long double constants". The
-    # ONLY long double constant in libtcc1.c / lib-arm64.c is the implicit 0.0L of
-    # comparisons like `a1 >= 0` (verified: no other float-suffixed or negative-zero
-    # long double literal exists), and 0.0L is all-zero bytes on every target. So
-    # teach that path to recognise a zero value and write LDOUBLE_SIZE zero bytes
-    # rather than memcmp the (narrower) host bytes; any future NON-zero constant
-    # still hits the original error, loudly, instead of silently corrupting. This
-    # keeps libtcc1 fully tcc-built (correct codegen) on every host — clang can't
-    # substitute: tcc's i386 static linker mishandles clang's constant-pool relocs.
-    substituteInPlace tccgen.c \
-      --replace-fail 'else if (0 == memcmp(ptr, &vtop->c.ld, LDOUBLE_SIZE))' 'else if (vtop->c.ld == 0.0)' \
-      --replace-fail '; /* nothing to do for 0.0 */' 'memset(ptr, 0, LDOUBLE_SIZE); /* 0.0L is all-zero on every target; host long double may be narrower */'
-  '';
+  # Source patches, shared by sysrootTree (libtcc1.a generation) and the host
+  # binary build. Each carries its reason in its header.
+  tccPatches = map (n: ./patches/${n}.patch) [
+    "libtcc1-udivmoddi4-global"
+    "armeabi-weak-mem-fallbacks"
+    "static-link-by-default"
+    "libc-rescan-after-libtcc1"
+    "i386-static-plt"
+    "riscv64-pcrel-hi-table"
+    "long-double-zero-constant"
+  ];
 
   # ---------------------------------------------------------------------------
   # sysrootTree: the embedded /zip tree (per-target headers + crt + libc.a +
@@ -286,15 +242,15 @@ let
   # HOST-INDEPENDENT — every libtcc1.a is target machine code emitted by tcc, the
   # musl sysroots are clang-built, the osx tier is the apple-sdk — so one build
   # serves x86_64/aarch64/armv7l Linux, the mingw PE, and both darwin arches, and
-  # is shared by the standalone binary (runtimeEmbed) AND the unpinbox mega
-  # (multicall.runtimeDataRoot). Built with the vanilla build-host stdenv (no
+  # is shared by the standalone binary (runtimeEmbed) AND any mega that folds
+  # tcc (multicall.runtimeDataRoot). Built with the vanilla build-host stdenv (no
   # engine): nothing here is host-arch code. flake.nix appends it to the binary's
   # EOF; the unpin-vfs SELF reader serves it at runtime.
   sysrootTree = linuxPkgs.stdenv.mkDerivation {
     pname = "tcc-sysroot-tree";
     inherit version src;
     nativeBuildInputs = [ linuxPkgs.buildPackages.which ];
-    postPatch = commonPatch;
+    patches = tccPatches;
 
     configurePhase = ''
       runHook preConfigure
@@ -310,16 +266,20 @@ let
       make ${lib.concatMapStringsSep " " (t: "${t}-tcc") allTargets} $J ${allPv} CC=${buildCC}
 
       echo "=== build each libtcc1.a by running its cross-tcc ==="
+      # `Nat=`: lib/Makefile puts tcov.o (the -ftest-coverage runtime) in the
+      # archive only for a native compiler; every target here is a cross.
+      # `Cbt=no Cbc=no` keep it from building the backtrace/bcheck objects,
+      # which need per-target flags and are built below.
       # XCC defaults to the target's cross-tcc → correct codegen, incl. arm's
       # armeabi.c divmod trick that gcc -O2 would miscompile. Each cross-tcc's baked
       # absolute INC-<t> dropped the {B}/include default, so feed the headers via
       # C_INCLUDE_PATH (musl per arch; in-tree mingw for PE; the SDK for osx).
       ${lib.concatMapStringsSep "\n    " (e:
-        "C_INCLUDE_PATH=${e.sysroot}/include make ${e.t}-libtcc1.a $J ${pvLine e.t}"
+        "C_INCLUDE_PATH=${e.sysroot}/include make ${e.t}-libtcc1.a $J Nat= Cbt=no Cbc=no ${pvLine e.t}"
       ) linuxTargets}
-      C_INCLUDE_PATH=$(pwd)/win32/include:$(pwd)/win32/include/winapi make ${winT}-libtcc1.a $J ${pvLine winT}
+      C_INCLUDE_PATH=$(pwd)/win32/include:$(pwd)/win32/include/winapi make ${winT}-libtcc1.a $J Nat= Cbt=no Cbc=no ${pvLine winT}
       ${lib.concatMapStringsSep "\n    " (e:
-        "C_INCLUDE_PATH=${sdkRoot}/usr/include make ${e.t}-libtcc1.a $J ${pvLine e.t}"
+        "C_INCLUDE_PATH=${sdkRoot}/usr/include make ${e.t}-libtcc1.a $J Nat= Cbt=no Cbc=no ${pvLine e.t}"
       ) osxTargets}
 
       echo "=== build each target's runmain.o (the -run support object) ==="
@@ -331,6 +291,29 @@ let
       for t in ${lib.concatStringsSep " " allTargets}; do
         ./$t-tcc -c lib/runmain.c -o $t-runmain.o
       done
+
+      echo "=== build each target's -b / -bt / -ftest-coverage support objects ==="
+      # lib/Makefile builds these only for a native compiler, like runmain.o.
+      # bt-exe.c includes tccrun.c, which takes its target from config.h (the
+      # build host's) unless TCC_TARGET_* is given, so each gets its target's
+      # DEF-<t> flags. They are linked by name (tcov.o, which belongs in
+      # libtcc1.a, comes from `Nat=` above). No bcheck.o on the Linux targets: it swaps
+      # malloc for its own through dlsym(RTLD_NEXT), which a static musl
+      # executable cannot do ("Cannot redirect malloc/free" at startup).
+      supp() {  # $1=target  $2=C_INCLUDE_PATH  $3=defines  $4=objects
+        for o in $4; do
+          extra=; [ $o = bcheck ] && extra=-bt
+          C_INCLUDE_PATH=$2:$(pwd)/include ./$1-tcc -I. $3 $extra -c lib/$o.c -o $1-$o.o
+        done
+      }
+      supp x86_64 ${(builtins.elemAt linuxTargets 0).sysroot}/include "-DTCC_TARGET_X86_64" "bt-exe bt-log"
+      supp i386 ${(builtins.elemAt linuxTargets 1).sysroot}/include "-DTCC_TARGET_I386" "bt-exe bt-log"
+      supp arm ${(builtins.elemAt linuxTargets 2).sysroot}/include "-DTCC_TARGET_ARM -DTCC_ARM_VFP -DTCC_ARM_EABI -DTCC_ARM_HARDFLOAT" "bt-exe bt-log"
+      supp arm64 ${(builtins.elemAt linuxTargets 3).sysroot}/include "-DTCC_TARGET_ARM64" "bt-exe bt-log"
+      supp riscv64 ${(builtins.elemAt linuxTargets 4).sysroot}/include "-DTCC_TARGET_RISCV64" "bt-exe bt-log"
+      supp ${winT} $(pwd)/win32/include:$(pwd)/win32/include/winapi "-DTCC_TARGET_X86_64 -DTCC_TARGET_PE" "bt-exe bt-log bcheck bt-dll"
+      supp x86_64-osx ${sdkRoot}/usr/include "-DTCC_TARGET_X86_64 -DTCC_TARGET_MACHO" "bt-exe bt-log bcheck"
+      supp arm64-osx ${sdkRoot}/usr/include "-DTCC_TARGET_ARM64 -DTCC_TARGET_MACHO" "bt-exe bt-log bcheck"
 
       echo "=== assemble the /zip tree with per-target sysroot subtrees ==="
       rm -rf zroot
@@ -346,7 +329,7 @@ let
         for l in m pthread dl rt crypt util xnet resolv; do
           cp -a $2/lib/lib$l.a zroot/$1/lib/
         done
-        cp -a $1-libtcc1.a $1-runmain.o zroot/$1/lib/tcc/
+        cp -a $1-libtcc1.a $1-runmain.o $1-bt-exe.o $1-bt-log.o zroot/$1/lib/tcc/
       }
       ${lib.concatMapStringsSep "\n    " (e: "mkLinux ${e.t} ${e.sysroot}") linuxTargets}
 
@@ -355,7 +338,8 @@ let
       cp -a win32/include/. zroot/${winT}/include/
       cp -a include/*.h     zroot/${winT}/include/
       cp -a win32/lib/*.def zroot/${winT}/lib/
-      cp -a ${winT}-libtcc1.a ${winT}-runmain.o zroot/${winT}/lib/tcc/
+      cp -a ${winT}-libtcc1.a ${winT}-runmain.o ${winT}-bt-exe.o ${winT}-bt-log.o \
+        ${winT}-bcheck.o ${winT}-bt-dll.o zroot/${winT}/lib/tcc/
 
       # osx subtree (shared by both arches at /zip/osx): SDK C headers + tcc
       # intrinsics, and libSystem.tbd under every name tcc may resolve. The VFS
@@ -373,7 +357,7 @@ let
         cp -a "$real" zroot/osx/lib/$n.tbd
       done
       ${lib.concatMapStringsSep "\n    " (e:
-        "mkdir -p zroot/${e.t}/lib/tcc && cp -a ${e.t}-libtcc1.a ${e.t}-runmain.o zroot/${e.t}/lib/tcc/"
+        "mkdir -p zroot/${e.t}/lib/tcc && cp -a ${e.t}-libtcc1.a ${e.t}-runmain.o ${e.t}-bt-exe.o ${e.t}-bt-log.o ${e.t}-bcheck.o zroot/${e.t}/lib/tcc/"
       ) osxTargets}
       chmod -R u+w zroot
 
@@ -386,7 +370,7 @@ let
       runHook preInstall
       mkdir -p "$out"
       # Contents map to /zip/ (no wrapping dir): $out/<target>/..., $out/common/...,
-      # $out/osx/... — withRuntimeData copies $out/. into the ZIP root, and the VFS
+      # $out/osx/... — the embed copies $out/. into the ZIP root, and the VFS
       # strips the "/zip/" prefix on lookup.
       cp -a zroot/. "$out/"
       runHook postInstall
@@ -405,7 +389,7 @@ hostStdenv.mkDerivation {
   nativeBuildInputs = [ pkgs.buildPackages.which pkgs.buildPackages.perl ];
   # No buildInputs: the host SDK (libSystem + libc headers) reaches darwin via the
   # engine stdenv's SDKROOT.
-  postPatch = commonPatch;
+  patches = tccPatches;
 
   # configure with the BUILD-host cc: ./configure builds c2str (run at build
   # time) and probes the build compiler. The host cc enters only at the recompile
@@ -421,13 +405,13 @@ hostStdenv.mkDerivation {
     J=-j''${NIX_BUILD_CORES:-1}
 
     # The unpin-llvm engine compiles every host object to LLVM BITCODE (it
-    # appends -flto), the prerequisite for folding tcc into the bitcode-LTO
-    # unpinbox mega. objcopy can't rename symbols in bitcode, and the mega link
-    # can't carry tcc's per-package `--wrap`, so on the engine we bind the VFS
-    # and de-collide the eight backends by REWRITING IR symbols instead (see the
-    # prefix() ENGINE branch + -DUNPIN_VFS_NOWRAP below). Off the engine (the
-    # mingw Windows cross) keep the objcopy + --wrap path. Probe rather than trust
-    # a platform flag, so a future off-engine build is handled correctly. $MT is
+    # appends -flto), which keeps tcc foldable into a bitcode-LTO mega.
+    # objcopy can't rename symbols in bitcode, and a mega link can't carry tcc's
+    # per-package `--wrap`, so we bind the VFS and de-collide the eight backends
+    # by REWRITING IR symbols (see the prefix() ENGINE branch +
+    # -DUNPIN_VFS_NOWRAP below). Every host, Windows included, is on the engine;
+    # the objcopy + --wrap branch only serves a host built off it. Probe rather
+    # than trust a platform flag. $MT is
     # the engine multitool (opt/llvm-as), reached via the cc-wrapper's objcopy
     # symlink. The probe accepts BOTH bitcode magics the engine emits: raw
     # `4243c0de` (linux) and its wrapper `dec0170b` (darwin wraps the bitcode in a
@@ -447,7 +431,7 @@ hostStdenv.mkDerivation {
     #     _WIN32 half has no NOWRAP mode, so there we select the explicit
     #     unpin_vfs_* API (-DUNPIN_VFS_WIN_WRAPOPEN, strict /zip prefix match) and
     #     src/vfs_win_bind.c names it unpinvfs_open. Still no --wrap.
-    #   off-engine (mingw PE): `ld --wrap=open` on plain msvcrt open()
+    #   off-engine (no current host; a non-engine PE): `ld --wrap=open` on open()
     #     (-DUNPIN_VFS_WIN_WRAPOPEN selects vfs.c's __wrap_open mode).
     if [ "$ENGINE" = 1 ]; then
       MT=""
@@ -502,8 +486,8 @@ hostStdenv.mkDerivation {
     #   -internalize localizes everything but <g>_main. `@sym` is a FUNCTION
     #   symbol (sigil differs from `%struct.sym`), so renaming @stat never
     #   touches `struct stat`. The Mach-O `_` is added only at object emission.
-    # OFF-ENGINE (PE on the mingw Windows cross): nm + objcopy --redefine-syms
-    #   prefixes every defined global. ELF/PE have no leading underscore.
+    # OFF-ENGINE (no current host): nm + objcopy --redefine-syms prefixes every
+    #   defined global. ELF/PE have no leading underscore.
     prefix() {  # $1 = target stem   $2 = C symbol tag (g)
       if [ "$ENGINE" = 1 ]; then
         $MT opt -S $1-tcc.o -o $1.ll
